@@ -386,6 +386,7 @@ import org.opensearch.telemetry.tracing.Tracer;
 import org.opensearch.threadpool.ExecutorBuilder;
 import org.opensearch.threadpool.FixedExecutorBuilder;
 import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.transport.StreamTransportService;
 import org.opensearch.transport.client.Client;
 import org.opensearch.watcher.ResourceWatcherService;
 
@@ -439,6 +440,7 @@ public class MachineLearningPlugin extends Plugin
     private MLModelChunkUploader mlModelChunkUploader;
     private MLEngine mlEngine;
     private StreamManagerWrapper streamManagerWrapper;
+    private StreamTransportService streamTransportService;
 
     private Client client;
     private ClusterService clusterService;
@@ -600,6 +602,34 @@ public class MachineLearningPlugin extends Plugin
 
         mlEngine = new MLEngine(dataPath, encryptor);
         streamManagerWrapper = new StreamManagerWrapper();
+        // Get TransportService through reflection
+        // TransportService transportService = null;
+        // Transport transport = null;
+        // // Access TransportService from NodeClient
+        // Field transportServiceField = NodeClient.class.getDeclaredField("remoteClusterService");
+        // transportServiceField.setAccessible(true);
+        // transportService = (TransportService) transportServiceField.get(client);
+        //
+        // // Access Transport from TransportService
+        // Field transportField = TransportService.class.getDeclaredField("transport");
+        // transportField.setAccessible(true);
+        // transport = (Transport) transportField.get(transportService);
+
+        // Create minimal mock transport
+        // streamTransportService = new StreamTransportService(
+        // settings,
+        // transport,
+        // threadPool,
+        // TransportService.NOOP_TRANSPORT_INTERCEPTOR,
+        // boundAddress -> clusterService.localNode(),
+        // clusterService.getClusterSettings(),
+        // new TaskManager(settings, threadPool, Collections.emptySet()),
+        // null,
+        //// new RemoteClusterService(settings, transportService),
+        // tracer
+        // );
+        streamTransportService = null;
+
         nodeHelper = new DiscoveryNodeHelper(clusterService, settings);
         modelCacheHelper = new MLModelCacheHelper(clusterService, settings);
         cmHandler = new OpenSearchConversationalMemoryHandler(client, clusterService);
@@ -863,7 +893,9 @@ public class MachineLearningPlugin extends Plugin
         RestMLPredictionStreamingAction restMLPredictionStreamingAction = new RestMLPredictionStreamingAction(
             mlModelManager,
             mlFeatureEnabledSetting,
-            streamManagerWrapper
+            streamManagerWrapper,
+            streamTransportService,
+            clusterService
         );
         RestMLExecuteAction restMLExecuteAction = new RestMLExecuteAction(mlFeatureEnabledSetting);
         RestMLGetModelAction restMLGetModelAction = new RestMLGetModelAction(mlFeatureEnabledSetting);
@@ -1371,12 +1403,12 @@ public class MachineLearningPlugin extends Plugin
         return (parser, id, jobDocVersion) -> MLJobParameter.parse(parser);
     }
 
-    public void onStreamManagerInitialized(StreamManager streamManager) {
-        this.streamManager = streamManager;
-        mlEngine.setStreamManager(streamManager);
-        mlEngine.setThreadPool(threadPool);
-        streamManagerWrapper.setStreamManager(streamManager);
-    }
+    // public void onStreamManagerInitialized(StreamManager streamManager) {
+    // this.streamManager = streamManager;
+    // mlEngine.setStreamManager(streamManager);
+    // mlEngine.setThreadPool(threadPool);
+    // streamManagerWrapper.setStreamManager(streamManager);
+    // }
 
     @Data
     public static class StreamManagerWrapper {

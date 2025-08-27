@@ -9,6 +9,8 @@ import static org.opensearch.ml.engine.algorithms.remote.ConnectorUtils.SKIP_VAL
 import static org.opensearch.ml.engine.algorithms.remote.ConnectorUtils.escapeRemoteInferenceInputData;
 import static org.opensearch.ml.engine.algorithms.remote.ConnectorUtils.processInput;
 
+import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashMap;
@@ -27,13 +29,20 @@ import org.opensearch.action.support.RetryableAction;
 import org.opensearch.arrow.spi.StreamManager;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.collect.Tuple;
+import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.TokenBucket;
+import org.opensearch.common.util.concurrent.ThreadContext;
+import org.opensearch.common.xcontent.XContentFactory;
+import org.opensearch.common.xcontent.support.XContentHttpChunk;
 import org.opensearch.commons.ConfigConstants;
 import org.opensearch.commons.authuser.User;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
+import org.opensearch.core.xcontent.XContentBuilder;
+import org.opensearch.http.HttpChunk;
 import org.opensearch.ml.common.FunctionName;
 import org.opensearch.ml.common.connector.Connector;
 import org.opensearch.ml.common.connector.ConnectorAction;
@@ -44,11 +53,15 @@ import org.opensearch.ml.common.dataset.TextDocsInputDataSet;
 import org.opensearch.ml.common.dataset.remote.RemoteInferenceInputDataSet;
 import org.opensearch.ml.common.input.MLInput;
 import org.opensearch.ml.common.model.MLGuard;
+import org.opensearch.ml.common.output.model.ModelTensor;
 import org.opensearch.ml.common.output.model.ModelTensorOutput;
 import org.opensearch.ml.common.output.model.ModelTensors;
 import org.opensearch.ml.common.transport.MLTaskResponse;
+import org.opensearch.rest.StreamingRestChannel;
 import org.opensearch.script.ScriptService;
+import org.opensearch.tasks.Task;
 import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.transport.TransportRequest;
 import org.opensearch.transport.client.Client;
 
 import lombok.Builder;
@@ -58,43 +71,81 @@ public interface RemoteConnectorExecutor {
     public String RETRY_EXECUTOR = "opensearch_ml_predict_remote";
 
     default void executeAction(String action, MLInput mlInput, ActionListener<MLTaskResponse> actionListener) {
-        ActionListener<Collection<Tuple<Integer, ModelTensors>>> tensorActionListener = ActionListener.wrap(r -> {
-            // Only all sub-requests success will call logics here
-            ModelTensors[] modelTensors = new ModelTensors[r.size()];
-            r.forEach(sequenceNoAndModelTensor -> modelTensors[sequenceNoAndModelTensor.v1()] = sequenceNoAndModelTensor.v2());
-            actionListener.onResponse(new MLTaskResponse(new ModelTensorOutput(Arrays.asList(modelTensors))));
-        }, actionListener::onFailure);
+        ThreadContext threadContext = getClient().threadPool().getThreadContext();
+        // Boolean isStreaming = threadContext.getTransient("ml.streaming.enabled");
+        Object streamObj = threadContext.getPersistent("ml.streaming.enabled");
+        getLogger().info("streamObj {}", streamObj);
 
-        try {
-            if (mlInput.getInputDataset() instanceof TextDocsInputDataSet) {
-                TextDocsInputDataSet textDocsInputDataSet = (TextDocsInputDataSet) mlInput.getInputDataset();
-                Tuple<Integer, Integer> calculatedChunkSize = calculateChunkSize(action, textDocsInputDataSet);
-                GroupedActionListener<Tuple<Integer, ModelTensors>> groupedActionListener = new GroupedActionListener<>(
-                    tensorActionListener,
-                    calculatedChunkSize.v1()
-                );
-                int sequence = 0;
-                for (int processedDocs = 0; processedDocs < textDocsInputDataSet.getDocs().size(); processedDocs += calculatedChunkSize
-                    .v2()) {
-                    List<String> textDocs = textDocsInputDataSet
-                        .getDocs()
-                        .subList(processedDocs, Math.min(processedDocs + calculatedChunkSize.v2(), textDocsInputDataSet.getDocs().size()));
-                    preparePayloadAndInvoke(
-                        action,
-                        MLInput
-                            .builder()
-                            .algorithm(FunctionName.TEXT_EMBEDDING)
-                            .inputDataset(TextDocsInputDataSet.builder().docs(textDocs).build())
-                            .build(),
-                        new ExecutionContext(sequence++),
-                        groupedActionListener
-                    );
+        String isStreaming = streamObj != null ? (String) streamObj : null;
+        getLogger().info("isStreaming is {}", isStreaming);
+
+        getLogger().info("ThreadContext streaming enabled: {}", isStreaming);
+        if ("true".equals(isStreaming)) {
+            // For streaming: bypass GroupedActionListener and call preparePayloadAndInvoke directly
+            getLogger().info("Executing streaming action, bypassing GroupedActionListener");
+
+            ActionListener<Collection<Tuple<Integer, ModelTensors>>> tensorActionListener = ActionListener.wrap(r -> {
+                // Convert to MLTaskResponse and send directly
+                ModelTensors[] modelTensors = new ModelTensors[r.size()];
+                r.forEach(sequenceNoAndModelTensor -> modelTensors[sequenceNoAndModelTensor.v1()] = sequenceNoAndModelTensor.v2());
+                actionListener.onResponse(new MLTaskResponse(new ModelTensorOutput(Arrays.asList(modelTensors))));
+            }, actionListener::onFailure);
+
+            // Call preparePayloadAndInvoke directly without GroupedActionListener
+            preparePayloadAndInvoke(action, mlInput, new ExecutionContext(0), new ActionListener<Tuple<Integer, ModelTensors>>() {
+                @Override
+                public void onResponse(Tuple<Integer, ModelTensors> response) {
+                    // For streaming, convert each response directly to MLTaskResponse
+                    actionListener.onResponse(new MLTaskResponse(new ModelTensorOutput(Arrays.asList(response.v2()))));
                 }
-            } else {
-                preparePayloadAndInvoke(action, mlInput, new ExecutionContext(0), new GroupedActionListener<>(tensorActionListener, 1));
+
+                @Override
+                public void onFailure(Exception e) {
+                    actionListener.onFailure(e);
+                }
+            });
+        } else {
+            ActionListener<Collection<Tuple<Integer, ModelTensors>>> tensorActionListener = ActionListener.wrap(r -> {
+                // Only all sub-requests success will call logics here
+                ModelTensors[] modelTensors = new ModelTensors[r.size()];
+                r.forEach(sequenceNoAndModelTensor -> modelTensors[sequenceNoAndModelTensor.v1()] = sequenceNoAndModelTensor.v2());
+                actionListener.onResponse(new MLTaskResponse(new ModelTensorOutput(Arrays.asList(modelTensors))));
+            }, actionListener::onFailure);
+
+            try {
+                if (mlInput.getInputDataset() instanceof TextDocsInputDataSet) {
+                    TextDocsInputDataSet textDocsInputDataSet = (TextDocsInputDataSet) mlInput.getInputDataset();
+                    Tuple<Integer, Integer> calculatedChunkSize = calculateChunkSize(action, textDocsInputDataSet);
+                    GroupedActionListener<Tuple<Integer, ModelTensors>> groupedActionListener = new GroupedActionListener<>(
+                        tensorActionListener,
+                        calculatedChunkSize.v1()
+                    );
+                    int sequence = 0;
+                    for (int processedDocs = 0; processedDocs < textDocsInputDataSet.getDocs().size(); processedDocs += calculatedChunkSize
+                        .v2()) {
+                        List<String> textDocs = textDocsInputDataSet
+                            .getDocs()
+                            .subList(
+                                processedDocs,
+                                Math.min(processedDocs + calculatedChunkSize.v2(), textDocsInputDataSet.getDocs().size())
+                            );
+                        preparePayloadAndInvoke(
+                            action,
+                            MLInput
+                                .builder()
+                                .algorithm(FunctionName.TEXT_EMBEDDING)
+                                .inputDataset(TextDocsInputDataSet.builder().docs(textDocs).build())
+                                .build(),
+                            new ExecutionContext(sequence++),
+                            groupedActionListener
+                        );
+                    }
+                } else {
+                    preparePayloadAndInvoke(action, mlInput, new ExecutionContext(0), new GroupedActionListener<>(tensorActionListener, 1));
+                }
+            } catch (Exception e) {
+                actionListener.onFailure(e);
             }
-        } catch (Exception e) {
-            actionListener.onFailure(e);
         }
     }
 
@@ -223,7 +274,11 @@ public interface RemoteConnectorExecutor {
             if (getConnectorClientConfig().getMaxRetryTimes() != 0) {
                 invokeRemoteServiceWithRetry(action, mlInput, parameters, payload, executionContext, actionListener);
             } else if (parameters.containsKey("stream")) {
-                invokeRemoteServiceStream(action, mlInput, parameters, payload, executionContext, actionListener);
+                getLogger().info("Detected streaming request with stream parameter: {}", parameters.get("stream"));
+                // Create a stream listener that accumulates content and calls the original listener once
+                StreamPredictActionListener<MLTaskResponse, ?> streamListener = createStreamListener(actionListener);
+                getLogger().info("Calling invokeRemoteServiceStream with created stream listener");
+                invokeRemoteServiceStream(action, mlInput, parameters, payload, executionContext, streamListener);
             } else {
                 invokeRemoteService(action, mlInput, parameters, payload, executionContext, actionListener);
             }
@@ -279,6 +334,191 @@ public interface RemoteConnectorExecutor {
         );
         invokeRemoteModelAction.run();
     };
+
+    default StreamPredictActionListener<MLTaskResponse, TransportRequest> createStreamListener(
+        ActionListener<Tuple<Integer, ModelTensors>> actionListener
+    ) {
+        getLogger().info("Creating stream listener for streaming request");
+
+        ThreadContext threadContext = getClient().threadPool().getThreadContext();
+        ActionListener<MLTaskResponse> originalListener = null;
+
+        Object streamIdObj = threadContext.getPersistent(Task.X_OPAQUE_ID);
+        String streamId = streamIdObj != null ? (String) streamIdObj : threadContext.getHeader(Task.X_OPAQUE_ID);
+        getLogger().info("streamId here is {}", streamId);
+
+        return new StreamPredictActionListener<MLTaskResponse, TransportRequest>(null, "stream", null) {
+            private final StringBuilder accumulatedContent = new StringBuilder();
+
+            @Override
+            public void onStreamResponse(MLTaskResponse response, boolean isLastBatch) {
+                getLogger().info("Stream listener received response, isLastBatch: {}", isLastBatch);
+
+                String content = extractContent(response);
+                getLogger().info("Extracted content: '{}'", content);
+
+                // Accumulate content
+                if (content != null && !content.isEmpty()) {
+                    accumulatedContent.append(content);
+                    getLogger().info("Accumulated content so far: '{}'", accumulatedContent.toString());
+                }
+
+                if (streamId != null) {
+                    StreamingRestChannel channel = StreamingRegistry.get(streamId);
+                    getLogger().info("channel is {}", channel);
+
+                    if (channel != null) {
+                        // Send chunk directly to REST channel
+                        try {
+                            channel.sendChunk(convertToHttpChunk(response));
+                        } catch (IOException e) {
+                            getLogger().error("Failed to send chunk", e);
+                        }
+                        // Send final marker when stream is actually complete
+                        if (isLastBatch) {
+                            getLogger().info("Stream completed - sending final marker");
+                            threadContext.putHeader("ml.streaming.isLastBatch", String.valueOf(isLastBatch));
+                            channel.sendChunk(XContentHttpChunk.last());
+                            StreamingRegistry.remove(streamId);
+                        }
+                    } else {
+                        // Try direct channel first (from ThreadContext)
+                        Object directChannel = threadContext.getPersistent("ml.streaming.rest.channel");
+                        if (directChannel == null) {
+                            directChannel = threadContext.getHeader("ml.streaming.rest.channel");
+                        }
+                        getLogger().info("Direct channel from ThreadContext: {}", directChannel);
+
+                        if (directChannel != null) {
+                            getLogger().info("Using direct StreamingRestChannel");
+                            try {
+                                java.lang.reflect.Method sendChunkMethod = directChannel
+                                    .getClass()
+                                    .getMethod("sendChunk", org.opensearch.http.HttpChunk.class);
+                                sendChunkMethod.invoke(directChannel, convertToHttpChunk(response));
+
+                                if (isLastBatch) {
+                                    getLogger().info("Stream completed - sending final marker via direct channel");
+                                    sendChunkMethod.invoke(directChannel, XContentHttpChunk.last());
+                                }
+                            } catch (Exception e) {
+                                getLogger().error("Failed to use direct channel", e);
+                            }
+                        } else {
+                            getLogger().info("No direct channel - using streaming transport bridge");
+                            // Use streaming transport to send chunks back to origin node
+                            try {
+                                // Get streaming transport service from ThreadContext or client
+                                Object streamTransportObj = threadContext.getPersistent("ml.streaming.transport.service");
+                                if (streamTransportObj != null) {
+                                    getLogger().info("Using streaming transport to send chunk");
+                                    // Use reflection to call streaming transport method
+                                    java.lang.reflect.Method sendStreamChunkMethod = streamTransportObj
+                                        .getClass()
+                                        .getMethod("sendStreamChunk", String.class, Object.class, boolean.class);
+                                    sendStreamChunkMethod.invoke(streamTransportObj, streamId, response, isLastBatch);
+                                } else {
+                                    getLogger().info("No streaming transport - accumulating");
+                                    if (isLastBatch) {
+                                        getLogger().info("Sending accumulated content: '{}'", accumulatedContent.toString());
+                                        List<ModelTensor> finalTensors = new ArrayList<>();
+                                        Map<String, Object> finalData = Map.of("content", accumulatedContent.toString(), "is_last", true);
+                                        finalTensors.add(ModelTensor.builder().name("response").dataAsMap(finalData).build());
+                                        actionListener.onResponse(new Tuple<>(0, new ModelTensors(finalTensors)));
+                                    }
+                                }
+                            } catch (Exception e) {
+                                getLogger().error("Failed to use streaming transport", e);
+                                if (isLastBatch) {
+                                    List<ModelTensor> finalTensors = new ArrayList<>();
+                                    Map<String, Object> finalData = Map.of("content", accumulatedContent.toString(), "is_last", true);
+                                    finalTensors.add(ModelTensor.builder().name("response").dataAsMap(finalData).build());
+                                    actionListener.onResponse(new Tuple<>(0, new ModelTensors(finalTensors)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            private HttpChunk convertToHttpChunk(MLTaskResponse response) throws IOException {
+                String content = "";
+
+                // Extract content using the same logic as the inner class
+                try {
+                    ModelTensorOutput output = (ModelTensorOutput) response.getOutput();
+                    if (output != null && !output.getMlModelOutputs().isEmpty()) {
+                        ModelTensors modelTensors = output.getMlModelOutputs().get(0);
+                        if (!modelTensors.getMlModelTensors().isEmpty()) {
+                            Map<String, ?> dataMap = modelTensors.getMlModelTensors().get(0).getDataAsMap();
+                            if (dataMap.containsKey("content")) {
+                                content = (String) dataMap.get("content");
+                                // Ensure content is not null and remove any extra quotes
+                                if (content == null) {
+                                    content = "";
+                                }
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    getLogger().error("Failed to extract content from response", e);
+                    content = "";
+                }
+
+                // Create JSON response
+                Map<String, Object> responseMap = Map.of("content", content);
+                XContentBuilder builder = XContentFactory.jsonBuilder().map(responseMap);
+                BytesReference bytesRef = BytesReference.bytes(builder);
+
+                return new HttpChunk() {
+                    @Override
+                    public void close() {
+                        if (bytesRef instanceof Releasable) {
+                            ((Releasable) bytesRef).close();
+                        }
+                    }
+
+                    @Override
+                    public boolean isLast() {
+                        return false;
+                    }
+
+                    @Override
+                    public BytesReference content() {
+                        return bytesRef;
+                    }
+                };
+            }
+
+            private String extractContent(MLTaskResponse response) {
+                try {
+                    ModelTensorOutput output = (ModelTensorOutput) response.getOutput();
+                    if (output != null && !output.getMlModelOutputs().isEmpty()) {
+                        ModelTensors modelTensors = output.getMlModelOutputs().get(0);
+                        if (!modelTensors.getMlModelTensors().isEmpty()) {
+                            Map<String, ?> dataMap = modelTensors.getMlModelTensors().get(0).getDataAsMap();
+                            if (dataMap.containsKey("content")) {
+                                return (String) dataMap.get("content");
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    getLogger().error("Failed to extract content", e);
+                }
+                return "";
+            }
+
+            @Override
+            public void onFailure(Exception e) {
+                getLogger().error("Stream listener failed", e);
+                if (originalListener != null) {
+                    originalListener.onFailure(e);
+                } else {
+                    actionListener.onFailure(e);
+                }
+            }
+        };
+    }
 
     void invokeRemoteService(
         String action,
@@ -347,7 +587,8 @@ public interface RemoteConnectorExecutor {
         Map<String, String> parameters,
         String payload,
         ExecutionContext executionContext,
-        ActionListener<Tuple<Integer, ModelTensors>> actionListener
+        StreamPredictActionListener<MLTaskResponse, ?> streamListener
+        // ActionListener<Tuple<Integer, ModelTensors>> actionListener
     );
 
     default void setStreamManager(StreamManager streamManager) {}

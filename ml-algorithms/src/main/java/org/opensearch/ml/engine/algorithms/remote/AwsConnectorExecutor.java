@@ -36,6 +36,7 @@ import org.opensearch.ml.common.input.MLInput;
 import org.opensearch.ml.common.model.MLGuard;
 import org.opensearch.ml.common.output.model.ModelTensor;
 import org.opensearch.ml.common.output.model.ModelTensors;
+import org.opensearch.ml.common.transport.MLTaskResponse;
 import org.opensearch.ml.common.utils.StringUtils;
 import org.opensearch.ml.engine.annotation.ConnectorExecutor;
 import org.opensearch.ml.engine.arrow.RemoteModelStreamProducer;
@@ -191,7 +192,8 @@ public class AwsConnectorExecutor extends AbstractConnectorExecutor {
         Map<String, String> parameters,
         String payload,
         ExecutionContext executionContext,
-        ActionListener<Tuple<Integer, ModelTensors>> actionListener
+        StreamPredictActionListener<MLTaskResponse, ?> actionListener
+        // ActionListener<Tuple<Integer, ModelTensors>> actionListener
     ) {
         try {
             RemoteModelStreamProducer streamProducer = new RemoteModelStreamProducer();
@@ -199,9 +201,9 @@ public class AwsConnectorExecutor extends AbstractConnectorExecutor {
             getLogger().debug("Stream ticket: {}", streamTicket);
             List<ModelTensor> modelTensors = new ArrayList<>();
             modelTensors.add(ModelTensor.builder().name("response").dataAsMap(Map.of("stream_ticket", streamTicket)).build());
-            threadPool.executor("opensearch_ml_predict_stream").execute(() -> {
-                actionListener.onResponse(new Tuple<>(0, new ModelTensors(modelTensors)));
-            });
+            // threadPool.executor("opensearch_ml_predict_stream").execute(() -> {
+            // actionListener.onResponse(new Tuple<>(0, new ModelTensors(modelTensors)));
+            // });
             String llmInterface = parameters.get(LLM_INTERFACE);
             llmInterface = llmInterface.trim().toLowerCase(Locale.ROOT);
             llmInterface = StringEscapeUtils.unescapeJava(llmInterface);
