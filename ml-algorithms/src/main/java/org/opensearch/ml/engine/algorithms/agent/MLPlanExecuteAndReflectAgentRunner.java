@@ -68,6 +68,7 @@ import org.opensearch.ml.common.utils.StringUtils;
 import org.opensearch.ml.engine.encryptor.Encryptor;
 import org.opensearch.ml.engine.memory.ConversationIndexMemory;
 import org.opensearch.remote.metadata.client.SdkClient;
+import org.opensearch.transport.TransportChannel;
 import org.opensearch.transport.client.Client;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -283,6 +284,11 @@ public class MLPlanExecuteAndReflectAgentRunner implements MLAgentRunner {
                     listener.onFailure(e);
                 }), messageHistoryLimit);
             }, listener::onFailure));
+    }
+
+    @Override
+    public void runStream(MLAgent mlAgent, Map<String, String> params, ActionListener<Object> listener, TransportChannel channel) {
+        throw new RuntimeException("should no go to per agent runner");
     }
 
     private void setToolsAndRunAgent(

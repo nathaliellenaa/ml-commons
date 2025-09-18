@@ -55,6 +55,7 @@ import org.opensearch.ml.engine.memory.ConversationIndexMemory;
 import org.opensearch.ml.engine.memory.ConversationIndexMessage;
 import org.opensearch.ml.repackage.com.google.common.annotations.VisibleForTesting;
 import org.opensearch.remote.metadata.client.SdkClient;
+import org.opensearch.transport.TransportChannel;
 import org.opensearch.transport.client.Client;
 
 import lombok.Data;
@@ -150,6 +151,11 @@ public class MLConversationalFlowAgentRunner implements MLAgentRunner {
                 listener.onFailure(e);
             }), messageHistoryLimit);
         }, listener::onFailure));
+    }
+
+    @Override
+    public void runStream(MLAgent mlAgent, Map<String, String> params, ActionListener<Object> listener, TransportChannel channel) {
+        throw new UnsupportedOperationException("Streaming is not supported for conversational flow agent.");
     }
 
     private void runAgent(

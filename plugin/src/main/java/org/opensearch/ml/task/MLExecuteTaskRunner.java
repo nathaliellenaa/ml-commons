@@ -7,14 +7,19 @@ package org.opensearch.ml.task;
 
 import static org.opensearch.ml.common.settings.MLCommonsSettings.ML_COMMONS_ENABLE_INHOUSE_PYTHON_MODEL;
 import static org.opensearch.ml.plugin.MachineLearningPlugin.EXECUTE_THREAD_POOL;
+import static org.opensearch.ml.plugin.MachineLearningPlugin.STREAM_EXECUTE_THREAD_POOL;
+
+import java.io.IOException;
 
 import org.opensearch.action.ActionListenerResponseHandler;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.ml.breaker.MLCircuitBreakerService;
 import org.opensearch.ml.cluster.DiscoveryNodeHelper;
 import org.opensearch.ml.common.FunctionName;
 import org.opensearch.ml.common.input.Input;
+import org.opensearch.ml.common.transport.execute.MLExecuteStreamingTaskAction;
 import org.opensearch.ml.common.transport.execute.MLExecuteTaskAction;
 import org.opensearch.ml.common.transport.execute.MLExecuteTaskRequest;
 import org.opensearch.ml.common.transport.execute.MLExecuteTaskResponse;
@@ -25,8 +30,12 @@ import org.opensearch.ml.stats.MLActionLevelStat;
 import org.opensearch.ml.stats.MLNodeLevelStat;
 import org.opensearch.ml.stats.MLStats;
 import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.transport.StreamTransportResponseHandler;
+import org.opensearch.transport.TransportChannel;
+import org.opensearch.transport.TransportException;
 import org.opensearch.transport.TransportResponseHandler;
 import org.opensearch.transport.client.Client;
+import org.opensearch.transport.stream.StreamTransportResponse;
 
 import lombok.extern.log4j.Log4j2;
 
@@ -74,8 +83,53 @@ public class MLExecuteTaskRunner extends MLTaskRunner<MLExecuteTaskRequest, MLEx
     }
 
     @Override
+    protected String getTransportStreamActionName() {
+        return MLExecuteStreamingTaskAction.NAME;
+    }
+
+    @Override
     protected TransportResponseHandler<MLExecuteTaskResponse> getResponseHandler(ActionListener<MLExecuteTaskResponse> listener) {
         return new ActionListenerResponseHandler<>(listener, MLExecuteTaskResponse::new);
+    }
+
+    protected TransportResponseHandler<MLExecuteTaskResponse> getResponseStreamHandler(
+        ActionListener<MLExecuteTaskResponse> listener,
+        TransportChannel channel
+    ) {
+        return new StreamTransportResponseHandler<MLExecuteTaskResponse>() {
+            @Override
+            public void handleStreamResponse(StreamTransportResponse<MLExecuteTaskResponse> streamResponse) {
+                try {
+                    MLExecuteTaskResponse response;
+                    while ((response = streamResponse.nextResponse()) != null) {
+                        channel.sendResponseBatch(response);
+                    }
+                    channel.completeStream();
+                    streamResponse.close();
+                } catch (Exception e) {
+                    streamResponse.cancel("Test error", e);
+                }
+            }
+
+            @Override
+            public void handleException(TransportException exp) {
+                try {
+                    channel.sendResponse(exp);
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            }
+
+            @Override
+            public String executor() {
+                return ThreadPool.Names.SAME;
+            }
+
+            @Override
+            public MLExecuteTaskResponse read(StreamInput in) throws IOException {
+                return new MLExecuteTaskResponse(in);
+            }
+        };
     }
 
     /**
@@ -118,4 +172,40 @@ public class MLExecuteTaskRunner extends MLTaskRunner<MLExecuteTaskRequest, MLEx
         });
     }
 
+    protected void executeTaskStream(
+        MLExecuteTaskRequest request,
+        ActionListener<MLExecuteTaskResponse> listener,
+        TransportChannel channel
+    ) {
+        threadPool.executor(STREAM_EXECUTE_THREAD_POOL).execute(() -> {
+            try {
+                mlStats.getStat(MLNodeLevelStat.ML_EXECUTING_TASK_COUNT).increment();
+                mlStats.getStat(MLNodeLevelStat.ML_REQUEST_COUNT).increment();
+                mlStats
+                    .createCounterStatIfAbsent(request.getFunctionName(), ActionName.EXECUTE, MLActionLevelStat.ML_ACTION_REQUEST_COUNT)
+                    .increment();
+
+                Input input = request.getInput();
+                FunctionName functionName = request.getFunctionName();
+                if (FunctionName.METRICS_CORRELATION.equals(functionName)) {
+                    if (!isPythonModelEnabled) {
+                        Exception exception = new IllegalArgumentException("This algorithm is not enabled from settings");
+                        listener.onFailure(exception);
+                        return;
+                    }
+                }
+                mlEngine.executeStream(input, ActionListener.wrap(output -> {
+                    MLExecuteTaskResponse response = new MLExecuteTaskResponse(functionName, output);
+                    listener.onResponse(response);
+                }, e -> { listener.onFailure(e); }), channel);
+            } catch (Exception e) {
+                mlStats
+                    .createCounterStatIfAbsent(request.getFunctionName(), ActionName.EXECUTE, MLActionLevelStat.ML_ACTION_FAILURE_COUNT)
+                    .increment();
+                listener.onFailure(e);
+            } finally {
+                mlStats.getStat(MLNodeLevelStat.ML_EXECUTING_TASK_COUNT).decrement();
+            }
+        });
+    }
 }

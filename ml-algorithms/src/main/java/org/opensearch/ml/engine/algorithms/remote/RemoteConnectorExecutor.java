@@ -29,6 +29,7 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.collect.Tuple;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.TokenBucket;
+import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.commons.ConfigConstants;
 import org.opensearch.commons.authuser.User;
 import org.opensearch.core.action.ActionListener;
@@ -49,6 +50,8 @@ import org.opensearch.ml.common.output.model.ModelTensors;
 import org.opensearch.ml.common.transport.MLTaskResponse;
 import org.opensearch.script.ScriptService;
 import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.transport.TransportChannel;
+import org.opensearch.transport.TransportRequest;
 import org.opensearch.transport.client.Client;
 
 import lombok.Builder;
@@ -58,43 +61,166 @@ public interface RemoteConnectorExecutor {
     public String RETRY_EXECUTOR = "opensearch_ml_predict_remote";
 
     default void executeAction(String action, MLInput mlInput, ActionListener<MLTaskResponse> actionListener) {
-        ActionListener<Collection<Tuple<Integer, ModelTensors>>> tensorActionListener = ActionListener.wrap(r -> {
-            // Only all sub-requests success will call logics here
-            ModelTensors[] modelTensors = new ModelTensors[r.size()];
-            r.forEach(sequenceNoAndModelTensor -> modelTensors[sequenceNoAndModelTensor.v1()] = sequenceNoAndModelTensor.v2());
-            actionListener.onResponse(new MLTaskResponse(new ModelTensorOutput(Arrays.asList(modelTensors))));
-        }, actionListener::onFailure);
+        ThreadContext threadContext = getClient().threadPool().getThreadContext();
+        // Boolean isStreaming = threadContext.getTransient("ml.streaming.enabled");
+        Object streamObj = threadContext.getPersistent("ml.streaming.enabled");
+        getLogger().info("streamObj {}", streamObj);
 
-        try {
-            if (mlInput.getInputDataset() instanceof TextDocsInputDataSet) {
-                TextDocsInputDataSet textDocsInputDataSet = (TextDocsInputDataSet) mlInput.getInputDataset();
-                Tuple<Integer, Integer> calculatedChunkSize = calculateChunkSize(action, textDocsInputDataSet);
-                GroupedActionListener<Tuple<Integer, ModelTensors>> groupedActionListener = new GroupedActionListener<>(
-                    tensorActionListener,
-                    calculatedChunkSize.v1()
-                );
-                int sequence = 0;
-                for (int processedDocs = 0; processedDocs < textDocsInputDataSet.getDocs().size(); processedDocs += calculatedChunkSize
-                    .v2()) {
-                    List<String> textDocs = textDocsInputDataSet
-                        .getDocs()
-                        .subList(processedDocs, Math.min(processedDocs + calculatedChunkSize.v2(), textDocsInputDataSet.getDocs().size()));
-                    preparePayloadAndInvoke(
-                        action,
-                        MLInput
-                            .builder()
-                            .algorithm(FunctionName.TEXT_EMBEDDING)
-                            .inputDataset(TextDocsInputDataSet.builder().docs(textDocs).build())
-                            .build(),
-                        new ExecutionContext(sequence++),
-                        groupedActionListener
+        String isStreaming = streamObj != null ? (String) streamObj : null;
+        getLogger().info("isStreaming is {}", isStreaming);
+
+        getLogger().info("ThreadContext streaming enabled: {}", isStreaming);
+        if ("true".equals(isStreaming)) {
+            throw new RuntimeException("Should not go here");
+            // For streaming: bypass GroupedActionListener and call preparePayloadAndInvoke directly
+            // getLogger().info("Executing streaming action, bypassing GroupedActionListener");
+            //
+            // ActionListener<Collection<Tuple<Integer, ModelTensors>>> tensorActionListener = ActionListener.wrap(r -> {
+            // // Convert to MLTaskResponse and send directly
+            // ModelTensors[] modelTensors = new ModelTensors[r.size()];
+            // r.forEach(sequenceNoAndModelTensor -> modelTensors[sequenceNoAndModelTensor.v1()] = sequenceNoAndModelTensor.v2());
+            // actionListener.onResponse(new MLTaskResponse(new ModelTensorOutput(Arrays.asList(modelTensors))));
+            // }, actionListener::onFailure);
+            //
+            // // Call preparePayloadAndInvoke directly without GroupedActionListener
+            // preparePayloadAndInvokeStream(action, mlInput, new ExecutionContext(0), new ActionListener<Tuple<Integer, ModelTensors>>() {
+            // @Override
+            // public void onResponse(Tuple<Integer, ModelTensors> response) {
+            // // For streaming, convert each response directly to MLTaskResponse
+            // actionListener.onResponse(new MLTaskResponse(new ModelTensorOutput(Arrays.asList(response.v2()))));
+            // }
+            //
+            // @Override
+            // public void onFailure(Exception e) {
+            // actionListener.onFailure(e);
+            // }
+            // }, channel);
+        } else {
+            ActionListener<Collection<Tuple<Integer, ModelTensors>>> tensorActionListener = ActionListener.wrap(r -> {
+                // Only all sub-requests success will call logics here
+                ModelTensors[] modelTensors = new ModelTensors[r.size()];
+                r.forEach(sequenceNoAndModelTensor -> modelTensors[sequenceNoAndModelTensor.v1()] = sequenceNoAndModelTensor.v2());
+                actionListener.onResponse(new MLTaskResponse(new ModelTensorOutput(Arrays.asList(modelTensors))));
+            }, actionListener::onFailure);
+
+            try {
+                if (mlInput.getInputDataset() instanceof TextDocsInputDataSet) {
+                    TextDocsInputDataSet textDocsInputDataSet = (TextDocsInputDataSet) mlInput.getInputDataset();
+                    Tuple<Integer, Integer> calculatedChunkSize = calculateChunkSize(action, textDocsInputDataSet);
+                    GroupedActionListener<Tuple<Integer, ModelTensors>> groupedActionListener = new GroupedActionListener<>(
+                        tensorActionListener,
+                        calculatedChunkSize.v1()
                     );
+                    int sequence = 0;
+                    for (int processedDocs = 0; processedDocs < textDocsInputDataSet.getDocs().size(); processedDocs += calculatedChunkSize
+                        .v2()) {
+                        List<String> textDocs = textDocsInputDataSet
+                            .getDocs()
+                            .subList(
+                                processedDocs,
+                                Math.min(processedDocs + calculatedChunkSize.v2(), textDocsInputDataSet.getDocs().size())
+                            );
+                        preparePayloadAndInvoke(
+                            action,
+                            MLInput
+                                .builder()
+                                .algorithm(FunctionName.TEXT_EMBEDDING)
+                                .inputDataset(TextDocsInputDataSet.builder().docs(textDocs).build())
+                                .build(),
+                            new ExecutionContext(sequence++),
+                            groupedActionListener
+                        );
+                    }
+                } else {
+                    preparePayloadAndInvoke(action, mlInput, new ExecutionContext(0), new GroupedActionListener<>(tensorActionListener, 1));
                 }
-            } else {
-                preparePayloadAndInvoke(action, mlInput, new ExecutionContext(0), new GroupedActionListener<>(tensorActionListener, 1));
+            } catch (Exception e) {
+                actionListener.onFailure(e);
             }
-        } catch (Exception e) {
-            actionListener.onFailure(e);
+        }
+    }
+
+    default void executeActionStream(
+        String action,
+        MLInput mlInput,
+        ActionListener<MLTaskResponse> actionListener,
+        TransportChannel channel
+    ) {
+        ThreadContext threadContext = getClient().threadPool().getThreadContext();
+        // Boolean isStreaming = threadContext.getTransient("ml.streaming.enabled");
+        Object streamObj = threadContext.getPersistent("ml.streaming.enabled");
+        getLogger().info("streamObj {}", streamObj);
+
+        String isStreaming = streamObj != null ? (String) streamObj : null;
+        getLogger().info("isStreaming is {}", isStreaming);
+
+        getLogger().info("ThreadContext streaming enabled: {}", isStreaming);
+        if ("true".equals(isStreaming)) {
+            // For streaming: bypass GroupedActionListener and call preparePayloadAndInvoke directly
+            getLogger().info("Executing streaming action, bypassing GroupedActionListener");
+
+            ActionListener<Collection<Tuple<Integer, ModelTensors>>> tensorActionListener = ActionListener.wrap(r -> {
+                // Convert to MLTaskResponse and send directly
+                ModelTensors[] modelTensors = new ModelTensors[r.size()];
+                r.forEach(sequenceNoAndModelTensor -> modelTensors[sequenceNoAndModelTensor.v1()] = sequenceNoAndModelTensor.v2());
+                actionListener.onResponse(new MLTaskResponse(new ModelTensorOutput(Arrays.asList(modelTensors))));
+            }, actionListener::onFailure);
+
+            // Call preparePayloadAndInvoke directly without GroupedActionListener
+            preparePayloadAndInvokeStream(action, mlInput, new ExecutionContext(0), new ActionListener<Tuple<Integer, ModelTensors>>() {
+                @Override
+                public void onResponse(Tuple<Integer, ModelTensors> response) {
+                    // For streaming, convert each response directly to MLTaskResponse
+                    actionListener.onResponse(new MLTaskResponse(new ModelTensorOutput(Arrays.asList(response.v2()))));
+                }
+
+                @Override
+                public void onFailure(Exception e) {
+                    actionListener.onFailure(e);
+                }
+            }, channel);
+        } else {
+            ActionListener<Collection<Tuple<Integer, ModelTensors>>> tensorActionListener = ActionListener.wrap(r -> {
+                // Only all sub-requests success will call logics here
+                ModelTensors[] modelTensors = new ModelTensors[r.size()];
+                r.forEach(sequenceNoAndModelTensor -> modelTensors[sequenceNoAndModelTensor.v1()] = sequenceNoAndModelTensor.v2());
+                actionListener.onResponse(new MLTaskResponse(new ModelTensorOutput(Arrays.asList(modelTensors))));
+            }, actionListener::onFailure);
+
+            try {
+                if (mlInput.getInputDataset() instanceof TextDocsInputDataSet) {
+                    TextDocsInputDataSet textDocsInputDataSet = (TextDocsInputDataSet) mlInput.getInputDataset();
+                    Tuple<Integer, Integer> calculatedChunkSize = calculateChunkSize(action, textDocsInputDataSet);
+                    GroupedActionListener<Tuple<Integer, ModelTensors>> groupedActionListener = new GroupedActionListener<>(
+                        tensorActionListener,
+                        calculatedChunkSize.v1()
+                    );
+                    int sequence = 0;
+                    for (int processedDocs = 0; processedDocs < textDocsInputDataSet.getDocs().size(); processedDocs += calculatedChunkSize
+                        .v2()) {
+                        List<String> textDocs = textDocsInputDataSet
+                            .getDocs()
+                            .subList(
+                                processedDocs,
+                                Math.min(processedDocs + calculatedChunkSize.v2(), textDocsInputDataSet.getDocs().size())
+                            );
+                        preparePayloadAndInvoke(
+                            action,
+                            MLInput
+                                .builder()
+                                .algorithm(FunctionName.TEXT_EMBEDDING)
+                                .inputDataset(TextDocsInputDataSet.builder().docs(textDocs).build())
+                                .build(),
+                            new ExecutionContext(sequence++),
+                            groupedActionListener
+                        );
+                    }
+                } else {
+                    preparePayloadAndInvoke(action, mlInput, new ExecutionContext(0), new GroupedActionListener<>(tensorActionListener, 1));
+                }
+            } catch (Exception e) {
+                actionListener.onFailure(e);
+            }
         }
     }
 
@@ -223,7 +349,78 @@ public interface RemoteConnectorExecutor {
             if (getConnectorClientConfig().getMaxRetryTimes() != 0) {
                 invokeRemoteServiceWithRetry(action, mlInput, parameters, payload, executionContext, actionListener);
             } else if (parameters.containsKey("stream")) {
-                invokeRemoteServiceStream(action, mlInput, parameters, payload, executionContext, actionListener);
+                throw new RuntimeException("should not go here");
+                // getLogger().info("Detected streaming request with stream parameter: {}", parameters.get("stream"));
+                // // Create a stream listener that accumulates content and calls the original listener once
+                // StreamPredictActionListener<MLTaskResponse, ?> streamListener = createStreamListener(channel, actionListener);
+                // getLogger().info("Calling invokeRemoteServiceStream with created stream listener");
+                // invokeRemoteServiceStream(action, mlInput, parameters, payload, executionContext, streamListener);
+            } else {
+                invokeRemoteService(action, mlInput, parameters, payload, executionContext, actionListener);
+            }
+        }
+    }
+
+    default void preparePayloadAndInvokeStream(
+        String action,
+        MLInput mlInput,
+        ExecutionContext executionContext,
+        ActionListener<Tuple<Integer, ModelTensors>> actionListener,
+        TransportChannel channel
+    ) {
+        Connector connector = getConnector();
+
+        Map<String, String> parameters = new HashMap<>();
+        if (connector.getParameters() != null) {
+            parameters.putAll(connector.getParameters());
+        }
+        MLInputDataset inputDataset = mlInput.getInputDataset();
+        Map<String, String> inputParameters = new HashMap<>();
+        if (inputDataset instanceof RemoteInferenceInputDataSet && ((RemoteInferenceInputDataSet) inputDataset).getParameters() != null) {
+            escapeRemoteInferenceInputData((RemoteInferenceInputDataSet) inputDataset);
+            inputParameters.putAll(((RemoteInferenceInputDataSet) inputDataset).getParameters());
+        }
+        parameters.putAll(inputParameters);
+        RemoteInferenceInputDataSet inputData = processInput(action, mlInput, connector, parameters, getScriptService());
+        if (inputData.getParameters() != null) {
+            parameters.putAll(inputData.getParameters());
+        }
+        // override again to always prioritize the input parameter
+        parameters.putAll(inputParameters);
+        String payload = connector.createPayload(action, parameters);
+        if (!Boolean.parseBoolean(parameters.getOrDefault(SKIP_VALIDATE_MISSING_PARAMETERS, "false"))) {
+            connector.validatePayload(payload);
+        }
+        String userStr = getClient()
+            .threadPool()
+            .getThreadContext()
+            .getTransient(ConfigConstants.OPENSEARCH_SECURITY_USER_INFO_THREAD_CONTEXT);
+        User user = User.parse(userStr);
+        if (getRateLimiter() != null && !getRateLimiter().request()) {
+            getLogger().error("Request is throttled at model level.");
+            throw new OpenSearchStatusException("Request is throttled at model level.", RestStatus.TOO_MANY_REQUESTS);
+        } else if (user != null
+            && getUserRateLimiterMap() != null
+            && getUserRateLimiterMap().get(user.getName()) != null
+            && !getUserRateLimiterMap().get(user.getName()).request()) {
+            getLogger().error("Request is throttled at user level.");
+            throw new OpenSearchStatusException(
+                "Request is throttled at user level. If you think there's an issue, please contact your cluster admin.",
+                RestStatus.TOO_MANY_REQUESTS
+            );
+        } else {
+            if (getMlGuard() != null && !getMlGuard().validate(payload, MLGuard.Type.INPUT, parameters)) {
+                getLogger().error("guardrails triggered for user input");
+                throw new IllegalArgumentException("guardrails triggered for user input");
+            }
+            if (getConnectorClientConfig().getMaxRetryTimes() != 0) {
+                invokeRemoteServiceWithRetry(action, mlInput, parameters, payload, executionContext, actionListener);
+            } else if (parameters.containsKey("stream")) {
+                getLogger().info("Detected streaming request with stream parameter: {}", parameters.get("stream"));
+                // Create a stream listener that accumulates content and calls the original listener once
+                StreamPredictActionListener<MLTaskResponse, ?> streamListener = createStreamListener(channel, actionListener);
+                getLogger().info("Calling invokeRemoteServiceStream with created stream listener");
+                invokeRemoteServiceStream(action, mlInput, parameters, payload, executionContext, streamListener);
             } else {
                 invokeRemoteService(action, mlInput, parameters, payload, executionContext, actionListener);
             }
@@ -280,6 +477,59 @@ public interface RemoteConnectorExecutor {
         invokeRemoteModelAction.run();
     };
 
+    default StreamPredictActionListener<MLTaskResponse, TransportRequest> createStreamListener(
+        TransportChannel channel,
+        ActionListener<Tuple<Integer, ModelTensors>> actionListener
+    ) {
+        getLogger().info("Creating stream listener for streaming request");
+        ActionListener<MLTaskResponse> originalListener = null;
+
+        return new StreamPredictActionListener<MLTaskResponse, TransportRequest>(channel, "stream", null) {
+
+            @Override
+            public void onStreamResponse(MLTaskResponse response, boolean isLastBatch) {
+                getLogger().info("Stream listener received response, isLastBatch: {}", isLastBatch);
+
+                String content = extractContent(response);
+                getLogger().info("Extracted content: '{}'", content);
+
+                channel.sendResponseBatch(response);
+                if (isLastBatch) {
+                    getLogger().info("Stream completed - sending final marker");
+                    channel.completeStream();
+                }
+            }
+
+            private String extractContent(MLTaskResponse response) {
+                try {
+                    ModelTensorOutput output = (ModelTensorOutput) response.getOutput();
+                    if (output != null && !output.getMlModelOutputs().isEmpty()) {
+                        ModelTensors modelTensors = output.getMlModelOutputs().get(0);
+                        if (!modelTensors.getMlModelTensors().isEmpty()) {
+                            Map<String, ?> dataMap = modelTensors.getMlModelTensors().get(0).getDataAsMap();
+                            if (dataMap.containsKey("content")) {
+                                return (String) dataMap.get("content");
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    getLogger().error("Failed to extract content", e);
+                }
+                return "";
+            }
+
+            @Override
+            public void onFailure(Exception e) {
+                getLogger().error("Stream listener failed", e);
+                if (originalListener != null) {
+                    originalListener.onFailure(e);
+                } else {
+                    actionListener.onFailure(e);
+                }
+            }
+        };
+    }
+
     void invokeRemoteService(
         String action,
         MLInput mlInput,
@@ -287,6 +537,15 @@ public interface RemoteConnectorExecutor {
         String payload,
         ExecutionContext executionContext,
         ActionListener<Tuple<Integer, ModelTensors>> actionListener
+    );
+
+    void invokeRemoteServiceStream(
+        String action,
+        MLInput mlInput,
+        Map<String, String> parameters,
+        String payload,
+        ExecutionContext executionContext,
+        StreamPredictActionListener<MLTaskResponse, ?> streamListener
     );
 
     static class RetryableActionExtension extends RetryableAction<Tuple<Integer, ModelTensors>> {
@@ -340,15 +599,6 @@ public interface RemoteConnectorExecutor {
         private final ExecutionContext executionContext;
         private final String payload;
     }
-
-    void invokeRemoteServiceStream(
-        String action,
-        MLInput mlInput,
-        Map<String, String> parameters,
-        String payload,
-        ExecutionContext executionContext,
-        ActionListener<Tuple<Integer, ModelTensors>> actionListener
-    );
 
     default void setStreamManager(StreamManager streamManager) {}
 
