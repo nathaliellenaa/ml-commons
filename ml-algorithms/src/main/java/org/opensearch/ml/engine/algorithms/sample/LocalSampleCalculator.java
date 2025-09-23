@@ -17,6 +17,7 @@ import org.opensearch.ml.common.output.Output;
 import org.opensearch.ml.common.output.execute.samplecalculator.LocalSampleCalculatorOutput;
 import org.opensearch.ml.engine.Executable;
 import org.opensearch.ml.engine.annotation.Function;
+import org.opensearch.transport.TransportChannel;
 import org.opensearch.transport.client.Client;
 
 import lombok.Data;
@@ -60,5 +61,10 @@ public class LocalSampleCalculator implements Executable {
             default:
                 throw new IllegalArgumentException("can't support this operation");
         }
+    }
+
+    @Override
+    public void executeStream(Input input, ActionListener<org.opensearch.ml.common.output.Output> listener, TransportChannel channel) {
+        throw new RuntimeException("should not go into metrics correlation");
     }
 }

@@ -51,6 +51,7 @@ import org.opensearch.search.aggregations.bucket.filter.FiltersAggregationBuilde
 import org.opensearch.search.aggregations.bucket.filter.FiltersAggregator.KeyedFilter;
 import org.opensearch.search.aggregations.metrics.NumericMetricsAggregation.SingleValue;
 import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.transport.TransportChannel;
 import org.opensearch.transport.client.Client;
 
 import lombok.Data;
@@ -526,5 +527,10 @@ public class AnomalyLocalizerImpl implements AnomalyLocalizer, Executable {
     @Override
     public void execute(Input input, ActionListener<Output> listener) {
         getLocalizationResults((AnomalyLocalizationInput) input, ActionListener.wrap(listener::onResponse, listener::onFailure));
+    }
+
+    @Override
+    public void executeStream(Input input, ActionListener<org.opensearch.ml.common.output.Output> listener, TransportChannel channel) {
+        throw new RuntimeException("should not go into metrics correlation");
     }
 }

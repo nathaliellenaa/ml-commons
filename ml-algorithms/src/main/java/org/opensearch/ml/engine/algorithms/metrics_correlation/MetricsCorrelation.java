@@ -68,6 +68,7 @@ import org.opensearch.ml.common.transport.task.MLTaskGetResponse;
 import org.opensearch.ml.engine.algorithms.DLModelExecute;
 import org.opensearch.ml.engine.annotation.Function;
 import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.transport.TransportChannel;
 import org.opensearch.transport.client.Client;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -235,6 +236,11 @@ public class MetricsCorrelation extends DLModelExecute {
 
         tensorOutputs.add(parseModelTensorOutput(djlOutput, null));
         listener.onResponse(new MetricsCorrelationOutput(tensorOutputs));
+    }
+
+    @Override
+    public void executeStream(Input input, ActionListener<org.opensearch.ml.common.output.Output> listener, TransportChannel channel) {
+        throw new RuntimeException("should not go into metrics correlation");
     }
 
     @VisibleForTesting

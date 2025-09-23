@@ -9,6 +9,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.ml.common.exception.ExecuteException;
 import org.opensearch.ml.common.input.Input;
 import org.opensearch.ml.common.output.Output;
+import org.opensearch.transport.TransportChannel;
 
 public interface Executable {
 
@@ -17,4 +18,6 @@ public interface Executable {
      * @param input input data
      */
     void execute(Input input, ActionListener<Output> listener) throws ExecuteException;
+
+    void executeStream(Input input, ActionListener<Output> listener, TransportChannel channel) throws ExecuteException;
 }

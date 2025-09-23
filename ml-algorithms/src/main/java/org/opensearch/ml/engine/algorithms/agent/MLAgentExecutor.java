@@ -76,6 +76,7 @@ import org.opensearch.remote.metadata.client.PutDataObjectRequest;
 import org.opensearch.remote.metadata.client.SdkClient;
 import org.opensearch.remote.metadata.common.SdkClientUtils;
 import org.opensearch.search.fetch.subphase.FetchSourceContext;
+import org.opensearch.transport.TransportChannel;
 import org.opensearch.transport.client.Client;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -313,6 +314,192 @@ public class MLAgentExecutor implements Executable, SettingsChangeListener {
         }
     }
 
+    @Override
+    public void executeStream(Input input, ActionListener<Output> listener, TransportChannel channel) {
+        if (!(input instanceof AgentMLInput)) {
+            throw new IllegalArgumentException("wrong input");
+        }
+        AgentMLInput agentMLInput = (AgentMLInput) input;
+        String agentId = agentMLInput.getAgentId();
+        String tenantId = agentMLInput.getTenantId();
+        Boolean isAsync = agentMLInput.getIsAsync();
+
+        RemoteInferenceInputDataSet inputDataSet = (RemoteInferenceInputDataSet) agentMLInput.getInputDataset();
+        if (inputDataSet == null || inputDataSet.getParameters() == null) {
+            throw new IllegalArgumentException("Agent input data can not be empty.");
+        }
+
+        if (isMultiTenancyEnabled && tenantId == null) {
+            throw new OpenSearchStatusException("You don't have permission to access this resource", RestStatus.FORBIDDEN);
+        }
+
+        List<ModelTensors> outputs = new ArrayList<>();
+        List<ModelTensor> modelTensors = new ArrayList<>();
+        outputs.add(ModelTensors.builder().mlModelTensors(modelTensors).build());
+
+        FetchSourceContext fetchSourceContext = new FetchSourceContext(true, Strings.EMPTY_ARRAY, Strings.EMPTY_ARRAY);
+        GetDataObjectRequest getDataObjectRequest = GetDataObjectRequest
+            .builder()
+            .index(ML_AGENT_INDEX)
+            .id(agentId)
+            .tenantId(tenantId)
+            .fetchSourceContext(fetchSourceContext)
+            .build();
+
+        if (clusterService.state().metadata().hasIndex(ML_AGENT_INDEX)) {
+            try (ThreadContext.StoredContext context = client.threadPool().getThreadContext().stashContext()) {
+                sdkClient
+                    .getDataObjectAsync(getDataObjectRequest, client.threadPool().executor("opensearch_ml_general"))
+                    .whenComplete((response, throwable) -> {
+                        context.restore();
+                        log.debug("Completed Get Agent Request, Agent id:{}", agentId);
+                        if (throwable != null) {
+                            Exception cause = SdkClientUtils.unwrapAndConvertToException(throwable);
+                            if (ExceptionsHelper.unwrap(cause, IndexNotFoundException.class) != null) {
+                                log.error("Failed to get Agent index", cause);
+                                listener.onFailure(new OpenSearchStatusException("Failed to get agent index", RestStatus.NOT_FOUND));
+                            } else {
+                                log.error("Failed to get ML Agent {}", agentId, cause);
+                                listener.onFailure(cause);
+                            }
+                        } else {
+                            try {
+                                GetResponse getAgentResponse = response.parser() == null
+                                    ? null
+                                    : GetResponse.fromXContent(response.parser());
+                                if (getAgentResponse != null && getAgentResponse.isExists()) {
+                                    try (
+                                        XContentParser parser = jsonXContent
+                                            .createParser(
+                                                xContentRegistry,
+                                                LoggingDeprecationHandler.INSTANCE,
+                                                getAgentResponse.getSourceAsString()
+                                            )
+                                    ) {
+                                        ensureExpectedToken(XContentParser.Token.START_OBJECT, parser.nextToken(), parser);
+                                        MLAgent mlAgent = MLAgent.parse(parser);
+                                        if (isMultiTenancyEnabled && !Objects.equals(tenantId, mlAgent.getTenantId())) {
+                                            listener
+                                                .onFailure(
+                                                    new OpenSearchStatusException(
+                                                        "You don't have permission to access this resource",
+                                                        RestStatus.FORBIDDEN
+                                                    )
+                                                );
+                                        }
+                                        MLMemorySpec memorySpec = mlAgent.getMemory();
+                                        String memoryId = inputDataSet.getParameters().get(MEMORY_ID);
+                                        String parentInteractionId = inputDataSet.getParameters().get(PARENT_INTERACTION_ID);
+                                        String regenerateInteractionId = inputDataSet.getParameters().get(REGENERATE_INTERACTION_ID);
+                                        String appType = mlAgent.getAppType();
+                                        String question = inputDataSet.getParameters().get(QUESTION);
+
+                                        MLTask mlTask = MLTask
+                                            .builder()
+                                            .taskType(MLTaskType.AGENT_EXECUTION)
+                                            .functionName(FunctionName.AGENT)
+                                            .state(MLTaskState.CREATED)
+                                            .workerNodes(ImmutableList.of(clusterService.localNode().getId()))
+                                            .createTime(Instant.now())
+                                            .lastUpdateTime(Instant.now())
+                                            .async(false)
+                                            .tenantId(tenantId)
+                                            .build();
+
+                                        if (memoryId == null && regenerateInteractionId != null) {
+                                            throw new IllegalArgumentException("A memory ID must be provided to regenerate.");
+                                        }
+                                        if (memorySpec != null
+                                            && memorySpec.getType() != null
+                                            && memoryFactoryMap.containsKey(memorySpec.getType())
+                                            && (memoryId == null || parentInteractionId == null)) {
+                                            ConversationIndexMemory.Factory conversationIndexMemoryFactory =
+                                                (ConversationIndexMemory.Factory) memoryFactoryMap.get(memorySpec.getType());
+                                            conversationIndexMemoryFactory
+                                                .create(question, memoryId, appType, ActionListener.wrap(memory -> {
+                                                    inputDataSet.getParameters().put(MEMORY_ID, memory.getConversationId());
+                                                    // get question for regenerate
+                                                    if (regenerateInteractionId != null) {
+                                                        log.info("Regenerate for existing interaction {}", regenerateInteractionId);
+                                                        client
+                                                            .execute(
+                                                                GetInteractionAction.INSTANCE,
+                                                                new GetInteractionRequest(regenerateInteractionId),
+                                                                ActionListener.wrap(interactionRes -> {
+                                                                    inputDataSet
+                                                                        .getParameters()
+                                                                        .putIfAbsent(QUESTION, interactionRes.getInteraction().getInput());
+                                                                    saveRootInteractionAndExecuteStream(
+                                                                        listener,
+                                                                        memory,
+                                                                        inputDataSet,
+                                                                        mlTask,
+                                                                        isAsync,
+                                                                        outputs,
+                                                                        modelTensors,
+                                                                        mlAgent,
+                                                                        channel
+                                                                    );
+                                                                }, e -> {
+                                                                    log.error("Failed to get existing interaction for regeneration", e);
+                                                                    listener.onFailure(e);
+                                                                })
+                                                            );
+                                                    } else {
+                                                        saveRootInteractionAndExecuteStream(
+                                                            listener,
+                                                            memory,
+                                                            inputDataSet,
+                                                            mlTask,
+                                                            isAsync,
+                                                            outputs,
+                                                            modelTensors,
+                                                            mlAgent,
+                                                            channel
+                                                        );
+                                                    }
+                                                }, ex -> {
+                                                    log.error("Failed to read conversation memory", ex);
+                                                    listener.onFailure(ex);
+                                                }));
+                                        } else {
+                                            executeAgentStream(
+                                                inputDataSet,
+                                                mlTask,
+                                                isAsync,
+                                                memoryId,
+                                                mlAgent,
+                                                outputs,
+                                                modelTensors,
+                                                listener,
+                                                channel
+                                            );
+                                        }
+                                    } catch (Exception e) {
+                                        log.error("Failed to parse ml agent {}", agentId, e);
+                                        listener.onFailure(e);
+                                    }
+                                } else {
+                                    listener
+                                        .onFailure(
+                                            new OpenSearchStatusException(
+                                                "Failed to find agent with the provided agent id: " + agentId,
+                                                RestStatus.NOT_FOUND
+                                            )
+                                        );
+                                }
+                            } catch (Exception e) {
+                                log.error("Failed to get agent", e);
+                                listener.onFailure(e);
+                            }
+                        }
+                    });
+            }
+        } else {
+            listener.onFailure(new ResourceNotFoundException("Agent index not found"));
+        }
+    }
+
     /**
      * save root interaction and start execute the agent
      * @param listener callback listener
@@ -378,6 +565,76 @@ public class MLAgentExecutor implements Executable, SettingsChangeListener {
         }));
     }
 
+    private void saveRootInteractionAndExecuteStream(
+        ActionListener<Output> listener,
+        ConversationIndexMemory memory,
+        RemoteInferenceInputDataSet inputDataSet,
+        MLTask mlTask,
+        boolean isAsync,
+        List<ModelTensors> outputs,
+        List<ModelTensor> modelTensors,
+        MLAgent mlAgent,
+        TransportChannel channel
+    ) {
+        String appType = mlAgent.getAppType();
+        String question = inputDataSet.getParameters().get(QUESTION);
+        String regenerateInteractionId = inputDataSet.getParameters().get(REGENERATE_INTERACTION_ID);
+        // Create root interaction ID
+        ConversationIndexMessage msg = ConversationIndexMessage
+            .conversationIndexMessageBuilder()
+            .type(appType)
+            .question(question)
+            .response("")
+            .finalAnswer(true)
+            .sessionId(memory.getConversationId())
+            .build();
+        memory.save(msg, null, null, null, ActionListener.<CreateInteractionResponse>wrap(interaction -> {
+            log.info("Created parent interaction ID: {}", interaction.getId());
+            inputDataSet.getParameters().put(PARENT_INTERACTION_ID, interaction.getId());
+            // only delete previous interaction when new interaction created
+            if (regenerateInteractionId != null) {
+                memory
+                    .getMemoryManager()
+                    .deleteInteractionAndTrace(
+                        regenerateInteractionId,
+                        ActionListener
+                            .wrap(
+                                deleted -> executeAgentStream(
+                                    inputDataSet,
+                                    mlTask,
+                                    isAsync,
+                                    memory.getConversationId(),
+                                    mlAgent,
+                                    outputs,
+                                    modelTensors,
+                                    listener,
+                                    channel
+                                ),
+                                e -> {
+                                    log.error("Failed to regenerate for interaction {}", regenerateInteractionId, e);
+                                    listener.onFailure(e);
+                                }
+                            )
+                    );
+            } else {
+                executeAgentStream(
+                    inputDataSet,
+                    mlTask,
+                    isAsync,
+                    memory.getConversationId(),
+                    mlAgent,
+                    outputs,
+                    modelTensors,
+                    listener,
+                    channel
+                );
+            }
+        }, ex -> {
+            log.error("Failed to create parent interaction", ex);
+            listener.onFailure(ex);
+        }));
+    }
+
     private void executeAgent(
         RemoteInferenceInputDataSet inputDataSet,
         MLTask mlTask,
@@ -429,6 +686,61 @@ public class MLAgentExecutor implements Executable, SettingsChangeListener {
         } else {
             ActionListener<Object> agentActionListener = createAgentActionListener(listener, outputs, modelTensors, mlAgent.getType());
             mlAgentRunner.run(mlAgent, inputDataSet.getParameters(), agentActionListener);
+        }
+    }
+
+    private void executeAgentStream(
+        RemoteInferenceInputDataSet inputDataSet,
+        MLTask mlTask,
+        boolean isAsync,
+        String memoryId,
+        MLAgent mlAgent,
+        List<ModelTensors> outputs,
+        List<ModelTensor> modelTensors,
+        ActionListener<Output> listener,
+        TransportChannel channel
+    ) {
+        String mcpConnectorConfigJSON = (mlAgent.getParameters() != null) ? mlAgent.getParameters().get(MCP_CONNECTORS_FIELD) : null;
+        if (mcpConnectorConfigJSON != null && !mcpConnectorIsEnabled) {
+            // MCP connector provided as tools but MCP feature is disabled, so abort.
+            listener.onFailure(new OpenSearchException(ML_COMMONS_MCP_CONNECTOR_DISABLED_MESSAGE));
+            return;
+        }
+        MLAgentRunner mlAgentRunner = getAgentRunner(mlAgent);
+        // If async is true, index ML task and return the taskID. Also add memoryID to the task if it exists
+        if (isAsync) {
+            Map<String, Object> agentResponse = new HashMap<>();
+            if (memoryId != null && !memoryId.isEmpty()) {
+                agentResponse.put(MEMORY_ID, memoryId);
+            }
+
+            String parentInteractionId = inputDataSet.getParameters().get(PARENT_INTERACTION_ID);
+            if (parentInteractionId != null && !parentInteractionId.isEmpty()) {
+                agentResponse.put(PARENT_INTERACTION_ID, parentInteractionId);
+            }
+            mlTask.setResponse(agentResponse);
+            mlTask.setAsync(true);
+
+            indexMLTask(mlTask, ActionListener.wrap(indexResponse -> {
+                String taskId = indexResponse.getId();
+                mlTask.setTaskId(taskId);
+
+                MLTaskOutput outputBuilder = MLTaskOutput.builder().taskId(taskId).status(MLTaskState.RUNNING.toString()).build();
+
+                if (memoryId != null && !memoryId.isEmpty()) {
+                    outputBuilder.setResponse(agentResponse);
+                }
+                listener.onResponse(outputBuilder);
+                ActionListener<Object> agentActionListener = createAsyncTaskUpdater(mlTask, outputs, modelTensors);
+                inputDataSet.getParameters().put(TASK_ID_FIELD, taskId);
+                mlAgentRunner.runStream(mlAgent, inputDataSet.getParameters(), agentActionListener, channel);
+            }, e -> {
+                log.error("Failed to create task for agent async execution", e);
+                listener.onFailure(e);
+            }));
+        } else {
+            ActionListener<Object> agentActionListener = createAgentActionListener(listener, outputs, modelTensors, mlAgent.getType());
+            mlAgentRunner.runStream(mlAgent, inputDataSet.getParameters(), agentActionListener, channel);
         }
     }
 

@@ -42,6 +42,7 @@ import org.opensearch.ml.engine.memory.ConversationIndexMemory;
 import org.opensearch.ml.repackage.com.google.common.annotations.VisibleForTesting;
 import org.opensearch.ml.repackage.com.google.common.collect.ImmutableMap;
 import org.opensearch.remote.metadata.client.SdkClient;
+import org.opensearch.transport.TransportChannel;
 import org.opensearch.transport.client.Client;
 
 import lombok.Data;
@@ -169,6 +170,11 @@ public class MLFlowAgentRunner implements MLAgentRunner {
         } else {
             firstTool.run(firstToolExecuteParams, firstStepListener);
         }
+    }
+
+    @Override
+    public void runStream(MLAgent mlAgent, Map<String, String> params, ActionListener<Object> listener, TransportChannel channel) {
+        throw new UnsupportedOperationException("Streaming is not supported for flow agent.");
     }
 
     @VisibleForTesting

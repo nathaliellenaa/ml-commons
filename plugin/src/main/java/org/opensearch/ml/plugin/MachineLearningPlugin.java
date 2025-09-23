@@ -89,6 +89,7 @@ import org.opensearch.ml.action.controller.UndeployControllerTransportAction;
 import org.opensearch.ml.action.controller.UpdateControllerTransportAction;
 import org.opensearch.ml.action.deploy.TransportDeployModelAction;
 import org.opensearch.ml.action.deploy.TransportDeployModelOnNodeAction;
+import org.opensearch.ml.action.execute.TransportExecuteStreamingTaskAction;
 import org.opensearch.ml.action.execute.TransportExecuteTaskAction;
 import org.opensearch.ml.action.forward.TransportForwardAction;
 import org.opensearch.ml.action.handler.MLSearchHandler;
@@ -112,6 +113,7 @@ import org.opensearch.ml.action.models.DeleteModelTransportAction;
 import org.opensearch.ml.action.models.GetModelTransportAction;
 import org.opensearch.ml.action.models.SearchModelTransportAction;
 import org.opensearch.ml.action.models.UpdateModelTransportAction;
+import org.opensearch.ml.action.prediction.TransportPredictionStreamingTaskAction;
 import org.opensearch.ml.action.prediction.TransportPredictionTaskAction;
 import org.opensearch.ml.action.profile.MLProfileAction;
 import org.opensearch.ml.action.profile.MLProfileTransportAction;
@@ -178,6 +180,7 @@ import org.opensearch.ml.common.transport.controller.MLUndeployControllerAction;
 import org.opensearch.ml.common.transport.controller.MLUpdateControllerAction;
 import org.opensearch.ml.common.transport.deploy.MLDeployModelAction;
 import org.opensearch.ml.common.transport.deploy.MLDeployModelOnNodeAction;
+import org.opensearch.ml.common.transport.execute.MLExecuteStreamingTaskAction;
 import org.opensearch.ml.common.transport.execute.MLExecuteTaskAction;
 import org.opensearch.ml.common.transport.forward.MLForwardAction;
 import org.opensearch.ml.common.transport.mcpserver.action.MLMcpMessageAction;
@@ -198,6 +201,7 @@ import org.opensearch.ml.common.transport.model_group.MLModelGroupGetAction;
 import org.opensearch.ml.common.transport.model_group.MLModelGroupSearchAction;
 import org.opensearch.ml.common.transport.model_group.MLRegisterModelGroupAction;
 import org.opensearch.ml.common.transport.model_group.MLUpdateModelGroupAction;
+import org.opensearch.ml.common.transport.prediction.MLPredictionStreamingTaskAction;
 import org.opensearch.ml.common.transport.prediction.MLPredictionTaskAction;
 import org.opensearch.ml.common.transport.register.MLRegisterModelAction;
 import org.opensearch.ml.common.transport.sync.MLSyncUpAction;
@@ -289,6 +293,7 @@ import org.opensearch.ml.rest.RestMLDeleteModelGroupAction;
 import org.opensearch.ml.rest.RestMLDeleteTaskAction;
 import org.opensearch.ml.rest.RestMLDeployModelAction;
 import org.opensearch.ml.rest.RestMLExecuteAction;
+import org.opensearch.ml.rest.RestMLExecuteStreamingAction;
 import org.opensearch.ml.rest.RestMLGetAgentAction;
 import org.opensearch.ml.rest.RestMLGetConfigAction;
 import org.opensearch.ml.rest.RestMLGetConnectorAction;
@@ -391,7 +396,6 @@ import org.opensearch.watcher.ResourceWatcherService;
 
 import com.google.common.annotations.VisibleForTesting;
 
-import lombok.Data;
 import lombok.SneakyThrows;
 
 public class MachineLearningPlugin extends Plugin
@@ -417,6 +421,7 @@ public class MachineLearningPlugin extends Plugin
     public static final String REGISTER_THREAD_POOL = "opensearch_ml_register";
     public static final String DEPLOY_THREAD_POOL = "opensearch_ml_deploy";
     public static final String STREAM_PREDICT_THREAD_POOL = "opensearch_ml_predict_stream";
+    public static final String STREAM_EXECUTE_THREAD_POOL = "opensearch_ml_execute_stream";
     public static final String ML_BASE_URI = "/_plugins/_ml";
 
     public static final String ML_COMMONS_JOBS_TYPE = "opensearch_ml_commons_jobs";
@@ -438,7 +443,6 @@ public class MachineLearningPlugin extends Plugin
 
     private MLModelChunkUploader mlModelChunkUploader;
     private MLEngine mlEngine;
-    private StreamManagerWrapper streamManagerWrapper;
 
     private Client client;
     private ClusterService clusterService;
@@ -473,7 +477,9 @@ public class MachineLearningPlugin extends Plugin
             .of(
                 new ActionHandler<>(MLStatsNodesAction.INSTANCE, MLStatsNodesTransportAction.class),
                 new ActionHandler<>(MLExecuteTaskAction.INSTANCE, TransportExecuteTaskAction.class),
+                new ActionHandler<>(MLExecuteStreamingTaskAction.INSTANCE, TransportExecuteStreamingTaskAction.class),
                 new ActionHandler<>(MLPredictionTaskAction.INSTANCE, TransportPredictionTaskAction.class),
+                new ActionHandler<>(MLPredictionStreamingTaskAction.INSTANCE, TransportPredictionStreamingTaskAction.class),
                 new ActionHandler<>(MLTrainingTaskAction.INSTANCE, TransportTrainingTaskAction.class),
                 new ActionHandler<>(MLTrainAndPredictionTaskAction.INSTANCE, TransportTrainAndPredictionTaskAction.class),
                 new ActionHandler<>(MLModelGetAction.INSTANCE, GetModelTransportAction.class),
@@ -599,7 +605,6 @@ public class MachineLearningPlugin extends Plugin
         encryptor = new EncryptorImpl(clusterService, client, sdkClient, mlIndicesHandler);
 
         mlEngine = new MLEngine(dataPath, encryptor);
-        streamManagerWrapper = new StreamManagerWrapper();
         nodeHelper = new DiscoveryNodeHelper(clusterService, settings);
         modelCacheHelper = new MLModelCacheHelper(clusterService, settings);
         cmHandler = new OpenSearchConversationalMemoryHandler(client, clusterService);
@@ -863,9 +868,13 @@ public class MachineLearningPlugin extends Plugin
         RestMLPredictionStreamingAction restMLPredictionStreamingAction = new RestMLPredictionStreamingAction(
             mlModelManager,
             mlFeatureEnabledSetting,
-            streamManagerWrapper
+            clusterService
         );
         RestMLExecuteAction restMLExecuteAction = new RestMLExecuteAction(mlFeatureEnabledSetting);
+        RestMLExecuteStreamingAction restMLExecuteStreamingAction = new RestMLExecuteStreamingAction(
+            mlFeatureEnabledSetting,
+            clusterService
+        );
         RestMLGetModelAction restMLGetModelAction = new RestMLGetModelAction(mlFeatureEnabledSetting);
         RestMLDeleteModelAction restMLDeleteModelAction = new RestMLDeleteModelAction(mlFeatureEnabledSetting);
         RestMLSearchModelAction restMLSearchModelAction = new RestMLSearchModelAction(mlFeatureEnabledSetting);
@@ -943,6 +952,7 @@ public class MachineLearningPlugin extends Plugin
                 restMLPredictionAction,
                 restMLPredictionStreamingAction,
                 restMLExecuteAction,
+                restMLExecuteStreamingAction,
                 restMLTrainAndPredictAction,
                 restMLGetModelAction,
                 restMLDeleteModelAction,
@@ -1084,6 +1094,14 @@ public class MachineLearningPlugin extends Plugin
             ML_THREAD_POOL_PREFIX + STREAM_PREDICT_THREAD_POOL,
             false
         );
+        FixedExecutorBuilder streamExecuteThreadPool = new FixedExecutorBuilder(
+            settings,
+            STREAM_EXECUTE_THREAD_POOL,
+            OpenSearchExecutors.allocatedProcessors(settings) * 4,
+            10000,
+            ML_THREAD_POOL_PREFIX + STREAM_EXECUTE_THREAD_POOL,
+            false
+        );
 
         return ImmutableList
             .of(
@@ -1096,7 +1114,8 @@ public class MachineLearningPlugin extends Plugin
                 remotePredictThreadPool,
                 batchIngestThreadPool,
                 sdkClientThreadPool,
-                streamPredictThreadPool
+                streamPredictThreadPool,
+                streamExecuteThreadPool
             );
     }
 
@@ -1370,17 +1389,4 @@ public class MachineLearningPlugin extends Plugin
     public ScheduledJobParser getJobParser() {
         return (parser, id, jobDocVersion) -> MLJobParameter.parse(parser);
     }
-
-    public void onStreamManagerInitialized(StreamManager streamManager) {
-        this.streamManager = streamManager;
-        mlEngine.setStreamManager(streamManager);
-        mlEngine.setThreadPool(threadPool);
-        streamManagerWrapper.setStreamManager(streamManager);
-    }
-
-    @Data
-    public static class StreamManagerWrapper {
-        private StreamManager streamManager;
-    }
-
 }
