@@ -75,6 +75,21 @@ public class HttpJsonConnectorExecutor extends AbstractConnectorExecutor {
         Duration readTimeout = Duration.ofSeconds(super.getConnectorClientConfig().getReadTimeout());
         Integer maxConnection = super.getConnectorClientConfig().getMaxConnections();
         this.httpClient = MLHttpClientFactory.getAsyncHttpClient(connectionTimeout, readTimeout, maxConnection);
+<<<<<<< Updated upstream
+=======
+        try {
+            AccessController.doPrivileged((PrivilegedExceptionAction<Void>) () -> {
+                this.okHttpClient = new OkHttpClient.Builder()
+                    .connectTimeout(connectionTimeout)
+                    .readTimeout(readTimeout)
+                    .retryOnConnectionFailure(true)
+                    .build();
+                return null;
+            });
+        } catch (PrivilegedActionException e) {
+            throw new RuntimeException("Failed to build OkHttpClient.", e);
+        }
+>>>>>>> Stashed changes
     }
 
     @Override
@@ -133,6 +148,38 @@ public class HttpJsonConnectorExecutor extends AbstractConnectorExecutor {
         }
     }
 
+<<<<<<< Updated upstream
+=======
+    @Override
+    public void invokeRemoteServiceStream(
+        String action,
+        MLInput mlInput,
+        Map<String, String> parameters,
+        String payload,
+        ExecutionContext executionContext,
+        StreamPredictActionListener<MLTaskResponse, ?> actionListener
+    ) {
+        try {
+            String llmInterface = parameters.get(LLM_INTERFACE);
+            llmInterface = llmInterface.trim().toLowerCase(Locale.ROOT);
+            llmInterface = StringEscapeUtils.unescapeJava(llmInterface);
+            validateLLMInterface(llmInterface);
+
+            log.info("Creating SSE connection for streaming request");
+            EventSourceListener listener = new HTTPEventSourceListener(actionListener, llmInterface);
+            Request request = ConnectorUtils.buildOKHttpStreamingRequest(action, connector, parameters, payload);
+
+            AccessController.doPrivileged((PrivilegedExceptionAction<Void>) () -> {
+                EventSources.createFactory(okHttpClient).newEventSource(request, listener);
+                return null;
+            });
+        } catch (Exception e) {
+            log.error("Failed to execute streaming", e);
+            actionListener.onFailure(e);
+        }
+    }
+
+>>>>>>> Stashed changes
     private void validateHttpClientParameters(String action, Map<String, String> parameters) throws Exception {
         String endpoint = connector.getActionEndpoint(action, parameters);
         URL url = new URL(endpoint);
@@ -141,4 +188,115 @@ public class HttpJsonConnectorExecutor extends AbstractConnectorExecutor {
         int port = url.getPort();
         MLHttpClientFactory.validate(protocol, host, port, connectorPrivateIpEnabled);
     }
+<<<<<<< Updated upstream
+=======
+
+    private void validateLLMInterface(String llmInterface) {
+        switch (llmInterface) {
+            case LLM_INTERFACE_OPENAI_V1_CHAT_COMPLETIONS:
+                break;
+            default:
+                throw new IllegalArgumentException(String.format("Unsupported llm interface: %s", llmInterface));
+        }
+    }
+
+    public final class HTTPEventSourceListener extends EventSourceListener {
+        private StreamPredictActionListener<MLTaskResponse, ?> streamActionListener;
+        private final String llmInterface;
+        private AtomicBoolean isStreamClosed;
+
+        public HTTPEventSourceListener(StreamPredictActionListener<MLTaskResponse, ?> streamActionListener, String llmInterface) {
+            this.streamActionListener = streamActionListener;
+            this.llmInterface = llmInterface;
+            this.isStreamClosed = new AtomicBoolean(false);
+        }
+
+        /***
+         * Callback when the SSE endpoint connection is made.
+         * @param eventSource the event source
+         * @param response the response
+         */
+        @Override
+        public void onOpen(EventSource eventSource, Response response) {
+            log.debug("Connected to SSE Endpoint.");
+        }
+
+        /***
+         * For each event received from the SSE endpoint
+         * @param eventSource The event source
+         * @param id The id of the event
+         * @param type The type of the event which is used to filter
+         * @param data The event data
+         */
+        @Override
+        public void onEvent(EventSource eventSource, String id, String type, String data) {
+            log.debug("The data is: {}", data);
+            switch (llmInterface) {
+                case LLM_INTERFACE_OPENAI_V1_CHAT_COMPLETIONS:
+                    onOpenAIEvent(data);
+                    break;
+                default:
+                    throw new IllegalArgumentException(String.format("Unsupported llm interface: %s", llmInterface));
+            }
+        }
+
+        /***
+         * When the connection is closed we receive this even which is currently only logged.
+         * @param eventSource The event source
+         */
+        @Override
+        public void onClosed(EventSource eventSource) {
+            log.debug("SSE CLOSED.");
+        }
+
+        /***
+         * If there is any failure we log the error and the stack trace
+         * During stream resets with no errors we set the connected flag to false to allow the main thread to attempt a re-connect
+         * @param eventSource The event source
+         * @param t The error object
+         * @param response The response
+         */
+        @Override
+        public void onFailure(EventSource eventSource, Throwable t, Response response) {
+            if (t != null) {
+                // Network/connection error
+                log.error("Error: " + t.getMessage(), t);
+                if (t instanceof StreamResetException && t.getMessage().contains("NO_ERROR")) {
+                    // TODO: reconnect
+                } else {
+                    streamActionListener.onFailure(new MLException("SSE failure with network error", t));
+                }
+            } else if (response != null) {
+                // HTTP error (e.g., 400 Bad Request)
+                try {
+                    String errorBody = response.body() != null ? response.body().string() : "";
+                    streamActionListener.onFailure(new MLException("Error from remote service: " + errorBody));
+                } catch (IOException e) {
+                    streamActionListener.onFailure(new MLException("SSE failure - unable to read error details"));
+                }
+            } else {
+                // Unknown failure
+                streamActionListener.onFailure(new MLException("SSE failure"));
+            }
+        }
+
+        private void onOpenAIEvent(String data) {
+            if (data.contentEquals("[DONE]")) {
+                sendCompletionResponse(isStreamClosed, streamActionListener);
+                return;
+            }
+            Map<String, Object> dataMap = StringUtils.fromJson(data, "data");
+            String llmFinishReason = JsonPath.read(dataMap, FINISH_REASON_PATH);
+            if (llmFinishReason != null && llmFinishReason.contentEquals("stop")) {
+                sendCompletionResponse(isStreamClosed, streamActionListener);
+                return;
+            }
+            String deltaContent = JsonPath.read(dataMap, "$.choices[0].delta.content");
+            if (deltaContent != null && !deltaContent.isEmpty()) {
+                log.debug("Streaming content: {}", deltaContent);
+                sendContentResponse(deltaContent, false, streamActionListener);
+            }
+        }
+    }
+>>>>>>> Stashed changes
 }

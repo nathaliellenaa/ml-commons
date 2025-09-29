@@ -126,6 +126,88 @@ public class AwsConnectorExecutor extends AbstractConnectorExecutor {
         }
     }
 
+<<<<<<< Updated upstream
+=======
+    @Override
+    public void invokeRemoteServiceStream(
+        String action,
+        MLInput mlInput,
+        Map<String, String> parameters,
+        String payload,
+        ExecutionContext executionContext,
+        StreamPredictActionListener<MLTaskResponse, ?> actionListener
+    ) {
+        try {
+            AtomicBoolean isStreamClosed = new AtomicBoolean(false);
+            String llmInterface = parameters.get(LLM_INTERFACE);
+            llmInterface = llmInterface.trim().toLowerCase(Locale.ROOT);
+            llmInterface = StringEscapeUtils.unescapeJava(llmInterface);
+            validateLLMInterface(llmInterface);
+
+            ConverseStreamRequest request = ConverseStreamRequest
+                .builder()
+                .modelId(parameters.get("model"))
+                .messages(Message.builder().role("user").content(ContentBlock.builder().text(parameters.get("inputs")).build()).build())
+                .build();
+
+            ConverseStreamResponseHandler handler = ConverseStreamResponseHandler.builder().onResponse(response -> {
+                // Handle initial response
+                log.debug("Initial converse stream response: {}", response);
+            }).onError(error -> {
+                // Handle errors
+                log.error("Converse stream error: {}", error.getMessage());
+                actionListener.onFailure(new MLException("Error from remote service: " + error.getMessage(), error));
+            }).onComplete(() -> {
+                // Handle completion
+                log.debug("Converse stream complete");
+                sendCompletionResponse(isStreamClosed, actionListener);
+            }).subscriber(event -> {
+                log.debug("Converse stream event: {}", event);
+                switch (event.sdkEventType()) {
+                    case CONTENT_BLOCK_DELTA:
+                        ContentBlockDeltaEvent contentEvent = (ContentBlockDeltaEvent) event;
+                        String chunk = contentEvent.delta().text();
+                        sendContentResponse(chunk, false, actionListener);
+                        break;
+                    default:
+                        // Throw exception for the other event types for now.
+                        log.warn("Unsupported event type: {}", event.sdkEventType());
+                        actionListener.onFailure(new IllegalArgumentException("Unsupported streaming event type: " + event.sdkEventType()));
+                        break;
+                }
+            }).build();
+            if (bedrockRuntimeAsyncClient == null) {
+                bedrockRuntimeAsyncClient = buildBedrockRuntimeAsyncClient(httpClient);
+            }
+            bedrockRuntimeAsyncClient.converseStream(request, handler);
+        } catch (Exception e) {
+            log.error("Failed to execute streaming", e);
+            actionListener.onFailure(new MLException("Fail to execute streaming", e));
+        }
+    }
+
+    private BedrockRuntimeAsyncClient buildBedrockRuntimeAsyncClient(SdkAsyncHttpClient sdkAsyncHttpClient) {
+        AwsCredentialsProvider awsCredentialsProvider;
+        if (connector.getSessionToken() != null) {
+            AwsSessionCredentials credentials = AwsSessionCredentials
+                .create(connector.getAccessKey(), connector.getSecretKey(), connector.getSessionToken());
+            awsCredentialsProvider = StaticCredentialsProvider.create(credentials);
+        } else {
+            awsCredentialsProvider = StaticCredentialsProvider
+                .create(
+                    software.amazon.awssdk.auth.credentials.AwsBasicCredentials.create(connector.getAccessKey(), connector.getSecretKey())
+                );
+        }
+
+        return BedrockRuntimeAsyncClient
+            .builder()
+            .region(Region.of(connector.getRegion()))
+            .credentialsProvider(awsCredentialsProvider)
+            .httpClient(sdkAsyncHttpClient)
+            .build();
+    }
+
+>>>>>>> Stashed changes
     private SdkHttpFullRequest signRequest(SdkHttpFullRequest request) {
         String accessKey = connector.getAccessKey();
         String secretKey = connector.getSecretKey();
@@ -135,4 +217,16 @@ public class AwsConnectorExecutor extends AbstractConnectorExecutor {
 
         return ConnectorUtils.signRequest(request, accessKey, secretKey, sessionToken, signingName, region);
     }
+<<<<<<< Updated upstream
+=======
+
+    private void validateLLMInterface(String llmInterface) {
+        switch (llmInterface) {
+            case LLM_INTERFACE_BEDROCK_CONVERSE_CLAUDE:
+                break;
+            default:
+                throw new IllegalArgumentException(String.format("Unsupported llm interface: %s", llmInterface));
+        }
+    }
+>>>>>>> Stashed changes
 }

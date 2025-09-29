@@ -459,4 +459,126 @@ public class ConnectorUtilsTest {
             .build();
         ConnectorUtils.buildSdkRequest("PREDICT", connector, Collections.emptyMap(), "{}", software.amazon.awssdk.http.SdkHttpMethod.POST);
     }
+<<<<<<< Updated upstream
+=======
+
+    @Test
+    public void testBuildOKHttpStreamingRequest_WithPayload() {
+        ConnectorAction predictAction = ConnectorAction
+            .builder()
+            .actionType(PREDICT)
+            .method("POST")
+            .url("http://test.com/mock")
+            .requestBody("{\"input\": \"${parameters.input}\"}")
+            .headers(ImmutableMap.of("Authorization", "Bearer token123"))
+            .build();
+
+        Connector connector = HttpConnector
+            .builder()
+            .name("test connector")
+            .version("1")
+            .protocol("http")
+            .actions(Arrays.asList(predictAction))
+            .build();
+
+        connector = spy(connector);
+        when(connector.getDecryptedHeaders()).thenReturn(ImmutableMap.of("Authorization", "Bearer token123"));
+
+        Map<String, String> parameters = ImmutableMap.of("input", "test input");
+        String payload = "{\"input\": \"test input\"}";
+
+        Request request = ConnectorUtils.buildOKHttpStreamingRequest(PREDICT.name(), connector, parameters, payload);
+
+        assertEquals("POST", request.method());
+        assertEquals("http://test.com/mock", request.url().toString());
+        assertEquals("Bearer token123", request.header("Authorization"));
+        assertEquals("", request.header("Accept-Encoding"));
+        assertEquals("text/event-stream", request.header("Accept"));
+        assertEquals("no-cache", request.header("Cache-Control"));
+        assertNotNull(request.body());
+    }
+
+    @Test
+    public void testBuildOKHttpStreamingRequest_NullPayload() {
+        exceptionRule.expect(IllegalArgumentException.class);
+        exceptionRule.expectMessage("Content length is 0. Aborting request to remote model");
+
+        ConnectorAction predictAction = ConnectorAction
+            .builder()
+            .actionType(PREDICT)
+            .method("POST")
+            .url("http://test.com/mock")
+            .requestBody("{\"input\": \"${parameters.input}\"}")
+            .build();
+
+        Connector connector = HttpConnector
+            .builder()
+            .name("test connector")
+            .version("1")
+            .protocol("http")
+            .actions(Arrays.asList(predictAction))
+            .build();
+
+        Map<String, String> parameters = new HashMap<>();
+        ConnectorUtils.buildOKHttpStreamingRequest(PREDICT.name(), connector, parameters, null);
+    }
+
+    @Test
+    public void testBuildOKHttpStreamingRequest_NoHeaders() {
+        ConnectorAction predictAction = ConnectorAction
+            .builder()
+            .actionType(PREDICT)
+            .method("POST")
+            .url("http://test.com/mock")
+            .requestBody("{\"input\": \"${parameters.input}\"}")
+            .build();
+
+        Connector connector = HttpConnector
+            .builder()
+            .name("test connector")
+            .version("1")
+            .protocol("http")
+            .actions(Arrays.asList(predictAction))
+            .build();
+
+        Map<String, String> parameters = new HashMap<>();
+        String payload = "{\"input\": \"test input\"}";
+
+        Request request = ConnectorUtils.buildOKHttpStreamingRequest(PREDICT.name(), connector, parameters, payload);
+
+        assertEquals("POST", request.method());
+        assertEquals("http://test.com/mock", request.url().toString());
+        assertNull(request.header("Authorization"));
+        assertEquals("", request.header("Accept-Encoding"));
+        assertEquals("text/event-stream", request.header("Accept"));
+        assertEquals("no-cache", request.header("Cache-Control"));
+    }
+
+    @Test
+    public void testBuildOKHttpStreamingRequest_WithParameters() {
+        ConnectorAction predictAction = ConnectorAction
+            .builder()
+            .actionType(PREDICT)
+            .method("POST")
+            .url("http://test.com/mock/${parameters.model}")
+            .requestBody("{\"input\": \"${parameters.input}\"}")
+            .build();
+
+        Connector connector = HttpConnector
+            .builder()
+            .name("test connector")
+            .version("1")
+            .protocol("http")
+            .actions(Arrays.asList(predictAction))
+            .build();
+
+        Map<String, String> parameters = ImmutableMap.of("model", "gpt-3.5", "input", "test input");
+        String payload = "{\"input\": \"test input\"}";
+
+        Request request = ConnectorUtils.buildOKHttpStreamingRequest(PREDICT.name(), connector, parameters, payload);
+
+        assertEquals("POST", request.method());
+        assertEquals("http://test.com/mock/gpt-3.5", request.url().toString());
+    }
+>>>>>>> Stashed changes
 }

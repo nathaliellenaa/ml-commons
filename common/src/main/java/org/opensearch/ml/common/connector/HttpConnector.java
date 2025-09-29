@@ -25,6 +25,11 @@ import java.util.function.BiFunction;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+<<<<<<< Updated upstream
+=======
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.text.StringEscapeUtils;
+>>>>>>> Stashed changes
 import org.apache.commons.text.StringSubstitutor;
 import org.opensearch.Version;
 import org.opensearch.common.io.stream.BytesStreamOutput;
@@ -51,6 +56,7 @@ public class HttpConnector extends AbstractConnector {
     public static final String PARAMETERS_FIELD = "parameters";
     public static final String SERVICE_NAME_FIELD = "service_name";
     public static final String REGION_FIELD = "region";
+    public static final String LLM_INTERFACE_OPENAI_V1_CHAT_COMPLETIONS = "openai/v1/chat/completions";
 
     // TODO: add RequestConfig like request time out,
 
@@ -357,6 +363,34 @@ public class HttpConnector extends AbstractConnector {
         return (T) parameters.get("http_body");
     }
 
+<<<<<<< Updated upstream
+=======
+    private boolean neededStreamParameterInPayload(Map<String, String> parameters) {
+        if (parameters == null) {
+            return false;
+        }
+
+        boolean isStream = parameters.containsKey("stream");
+        if (!isStream) {
+            return false;
+        }
+
+        String llmInterface = parameters.get("_llm_interface");
+        if (StringUtils.isBlank(llmInterface)) {
+            return false;
+        }
+
+        llmInterface = llmInterface.trim().toLowerCase(Locale.ROOT);
+        llmInterface = StringEscapeUtils.unescapeJava(llmInterface);
+        switch (llmInterface) {
+            case LLM_INTERFACE_OPENAI_V1_CHAT_COMPLETIONS:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+>>>>>>> Stashed changes
     protected String fillNullParameters(Map<String, String> parameters, String payload) {
         List<String> bodyParams = findStringParametersWithNullDefaultValue(payload);
         String newPayload = payload;
