@@ -42,6 +42,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
 import org.apache.commons.text.StringSubstitutor;
+import org.opensearch.action.ActionRequest;
 import org.opensearch.action.StepListener;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.settings.Settings;
@@ -63,6 +64,7 @@ import org.opensearch.ml.common.output.model.ModelTensors;
 import org.opensearch.ml.common.spi.memory.Memory;
 import org.opensearch.ml.common.spi.tools.Tool;
 import org.opensearch.ml.common.transport.MLTaskResponse;
+import org.opensearch.ml.common.transport.execute.MLExecuteStreamTaskAction;
 import org.opensearch.ml.common.transport.execute.MLExecuteTaskAction;
 import org.opensearch.ml.common.transport.execute.MLExecuteTaskRequest;
 import org.opensearch.ml.common.transport.prediction.MLPredictionTaskAction;
@@ -91,6 +93,7 @@ public class MLPlanExecuteAndReflectAgentRunner implements MLAgentRunner {
     private final Map<String, Memory.Factory> memoryFactoryMap;
     private SdkClient sdkClient;
     private Encryptor encryptor;
+    private StreamingWrapper streamingWrapper;
     // flag to track if task has been updated with executor memory ids or not
     private boolean taskUpdated = false;
     private final Map<String, Object> taskUpdates = new HashMap<>();
@@ -181,6 +184,9 @@ public class MLPlanExecuteAndReflectAgentRunner implements MLAgentRunner {
 
     @VisibleForTesting
     void setupPromptParameters(Map<String, String> params) {
+        // Set agent type for PER agent for streaming
+        params.put("agent_type", "per");
+
         // populated depending on whether LLM is asked to plan or re-evaluate
         // removed here, so that error is thrown in case this field is not populated
         params.remove(PROMPT_FIELD);
@@ -272,6 +278,7 @@ public class MLPlanExecuteAndReflectAgentRunner implements MLAgentRunner {
 
     @Override
     public void run(MLAgent mlAgent, Map<String, String> apiParams, ActionListener<Object> listener, TransportChannel channel) {
+        this.streamingWrapper = new StreamingWrapper(channel, client);
         Map<String, String> allParams = new HashMap<>();
         allParams.putAll(apiParams);
         allParams.putAll(mlAgent.getParameters());
@@ -386,22 +393,20 @@ public class MLPlanExecuteAndReflectAgentRunner implements MLAgentRunner {
             return;
         }
 
-        MLPredictionTaskRequest request = new MLPredictionTaskRequest(
-            llm.getModelId(),
-            RemoteInferenceMLInput
-                .builder()
-                .algorithm(FunctionName.REMOTE)
-                .inputDataset(RemoteInferenceInputDataSet.builder().parameters(allParams).build())
-                .build(),
-            null,
+        ActionRequest request = streamingWrapper.createPredictionRequest(
+            llm,
+            allParams,
             allParams.get(TENANT_ID_FIELD)
         );
 
         StepListener<MLTaskResponse> planListener = new StepListener<>();
 
         planListener.whenComplete(llmOutput -> {
+            log.info("PER Agent received planner LLM response");
             ModelTensorOutput modelTensorOutput = (ModelTensorOutput) llmOutput.getOutput();
+            log.info("Parsing LLM output: {}", modelTensorOutput);
             Map<String, Object> parseLLMOutput = parseLLMOutput(allParams, modelTensorOutput);
+            log.info("Parsed LLM output: {}", parseLLMOutput);
 
             if (parseLLMOutput.get(RESULT_FIELD) != null) {
                 String finalResult = (String) parseLLMOutput.get(RESULT_FIELD);
@@ -416,10 +421,13 @@ public class MLPlanExecuteAndReflectAgentRunner implements MLAgentRunner {
                 );
             } else {
                 List<String> steps = (List<String>) parseLLMOutput.get(STEPS_FIELD);
+                log.info("PER Agent executing steps: {}", steps);
                 addSteps(steps, allParams, STEPS_FIELD);
 
                 String stepToExecute = steps.getFirst();
+                log.info("Executing step: {}", stepToExecute);
                 String reActAgentId = allParams.get(EXECUTOR_AGENT_ID_FIELD);
+                log.info("Using executor agent ID: {}", reActAgentId);
                 Map<String, String> reactParams = new HashMap<>();
                 reactParams.put(QUESTION_FIELD, stepToExecute);
                 if (allParams.containsKey(EXECUTOR_AGENT_MEMORY_ID_FIELD)) {
@@ -444,7 +452,9 @@ public class MLPlanExecuteAndReflectAgentRunner implements MLAgentRunner {
 
                 MLExecuteTaskRequest executeRequest = new MLExecuteTaskRequest(FunctionName.AGENT, agentInput);
 
+                log.info("PER Agent calling executor agent with step: {}", stepToExecute);
                 client.execute(MLExecuteTaskAction.INSTANCE, executeRequest, ActionListener.wrap(executeResponse -> {
+                    log.info("PER Agent received executor response");
                     ModelTensorOutput reactResult = (ModelTensorOutput) executeResponse.getOutput();
 
                     // Navigate through the structure to get the response
@@ -468,8 +478,10 @@ public class MLPlanExecuteAndReflectAgentRunner implements MLAgentRunner {
                     });
 
                     if (!results.containsKey(STEP_RESULT_FIELD)) {
+                        log.error("PER Agent: No valid response found in ReAct agent output. Results: {}", results);
                         throw new IllegalStateException("No valid response found in ReAct agent output");
                     }
+                    log.info("PER Agent extracted step result: {}", results.get(STEP_RESULT_FIELD));
 
                     // Only add memory_id to params if it exists and is not empty
                     String reActMemoryId = results.get(MEMORY_ID_FIELD);
@@ -532,7 +544,7 @@ public class MLPlanExecuteAndReflectAgentRunner implements MLAgentRunner {
                         finalListener
                     );
                 }, e -> {
-                    log.error("Failed to execute ReAct agent", e);
+                    log.error("PER Agent: Failed to execute ReAct agent for step: {}", stepToExecute, e);
                     finalListener.onFailure(e);
                 }));
             }
@@ -540,8 +552,8 @@ public class MLPlanExecuteAndReflectAgentRunner implements MLAgentRunner {
             log.error("Failed to run deep research agent", e);
             finalListener.onFailure(e);
         });
-
-        client.execute(MLPredictionTaskAction.INSTANCE, request, planListener);
+        streamingWrapper.executeRequest(request, (ActionListener<MLTaskResponse>) planListener);
+//        client.execute(MLPredictionTaskAction.INSTANCE, request, planListener);
     }
 
     @VisibleForTesting
@@ -646,6 +658,9 @@ public class MLPlanExecuteAndReflectAgentRunner implements MLAgentRunner {
         }
 
         memory.getMemoryManager().updateInteraction(parentInteractionId, updateContent, ActionListener.wrap(res -> {
+            // Send completion chunk to close streaming connection
+            streamingWrapper.sendCompletionChunk(memory.getConversationId(), parentInteractionId, reactAgentMemoryId, reactParentInteractionId);
+
             List<ModelTensors> finalModelTensors = createModelTensors(
                 memory.getConversationId(),
                 parentInteractionId,

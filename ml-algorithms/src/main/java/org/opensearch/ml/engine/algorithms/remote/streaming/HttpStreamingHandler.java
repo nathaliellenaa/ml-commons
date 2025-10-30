@@ -76,7 +76,8 @@ public class HttpStreamingHandler extends BaseStreamingHandler {
     ) {
         try {
             log.info("Creating SSE connection for streaming request");
-            EventSourceListener listener = new HTTPEventSourceListener(actionListener, llmInterface);
+            String agentType = parameters.get("agent_type");
+            EventSourceListener listener = new HTTPEventSourceListener(actionListener, llmInterface, agentType);
             Request request = ConnectorUtils.buildOKHttpStreamingRequest(action, connector, parameters, payload);
 
             AccessController.doPrivileged((PrivilegedExceptionAction<Void>) () -> {
@@ -100,16 +101,19 @@ public class HttpStreamingHandler extends BaseStreamingHandler {
         private StreamPredictActionListener<MLTaskResponse, ?> streamActionListener;
         private final String llmInterface;
         private AtomicBoolean isStreamClosed;
+        private final String agentType;
         private boolean functionCallInProgress = false;
         private boolean agentExecutionInProgress = false;
         private String accumulatedToolCallId = null;
         private String accumulatedToolName = null;
         private String accumulatedArguments = "";
+        private StringBuilder accumulatedContent = new StringBuilder();
 
-        public HTTPEventSourceListener(StreamPredictActionListener<MLTaskResponse, ?> streamActionListener, String llmInterface) {
+        public HTTPEventSourceListener(StreamPredictActionListener<MLTaskResponse, ?> streamActionListener, String llmInterface, String agentType) {
             this.streamActionListener = streamActionListener;
             this.llmInterface = llmInterface;
             this.isStreamClosed = new AtomicBoolean(false);
+            this.agentType = agentType;
         }
 
         /***
@@ -200,20 +204,34 @@ public class HttpStreamingHandler extends BaseStreamingHandler {
             if (!agentExecutionInProgress) {
                 sendCompletionResponse(isStreamClosed, streamActionListener);
             }
+//            if (!agentExecutionInProgress) {
+//                // For PER agents, if we have accumulated content, complete the planner response
+//                if (accumulatedContent.length() > 0) {
+//                    completePlannerResponse();
+//                } else {
+//                    sendCompletionResponse(isStreamClosed, streamActionListener);
+//                }
+//            }
         }
 
         private void processStreamChunk(Map<String, Object> dataMap) {
             // Handle stop finish reason
             String finishReason = extractPath(dataMap, "$.choices[0].finish_reason");
             if ("stop".equals(finishReason)) {
-                agentExecutionInProgress = false;
-                sendCompletionResponse(isStreamClosed, streamActionListener);
+                // For PER agent, we should keep the connection open after the planner LLM finish
+                if ("per".equals(agentType)) {
+                    completePlannerResponse();
+                } else {
+                    agentExecutionInProgress = false;
+                    sendCompletionResponse(isStreamClosed, streamActionListener);
+                }
                 return;
             }
 
             // Process content
             String content = extractPath(dataMap, "$.choices[0].delta.content");
             if (content != null && !content.isEmpty()) {
+                accumulatedContent.append(content);
                 sendContentResponse(content, false, streamActionListener);
             }
 
@@ -266,6 +284,64 @@ public class HttpStreamingHandler extends BaseStreamingHandler {
             ModelTensor tensor = ModelTensor.builder().name("response").dataAsMap(responseData).build();
             ModelTensors tensors = ModelTensors.builder().mlModelTensors(List.of(tensor)).build();
             return ModelTensorOutput.builder().mlModelOutputs(List.of(tensors)).build();
+        }
+
+        private void completePlannerResponse() {
+            String fullContent = accumulatedContent.toString().trim();
+            log.info("Completing planner response with content: {}", fullContent);
+            String structuredResponse = buildStructuredPlanResponse(fullContent);
+            log.info("Structured response: {}", structuredResponse);
+            
+            // Create OpenAI-compatible response format
+            Map<String, Object> message = Map.of("content", structuredResponse);
+            Map<String, Object> choice = Map.of("message", message);
+            Map<String, Object> response = Map.of("choices", List.of(choice));
+            
+            ModelTensorOutput output = createModelTensorOutput(response);
+            // Send response but keep connection open for agent workflow
+            log.info("Sending planner response to agent");
+            streamActionListener.onResponse(new MLTaskResponse(output));
+            agentExecutionInProgress = true;
+            log.info("Set agentExecutionInProgress = true");
+        }
+
+        private String buildStructuredPlanResponse(String content) {
+            // Extract JSON from markdown if needed
+            String json = extractJsonFromContent(content);
+            if (json != null) {
+                return json;
+            }
+            
+            // If no valid JSON found, create default structure
+            Map<String, Object> response = Map.of(
+                "steps", List.of(content),
+                "result", ""
+            );
+            return StringUtils.toJson(response);
+        }
+
+        private String extractJsonFromContent(String content) {
+            try {
+                if (content.contains("```json")) {
+                    int start = content.indexOf("```json") + 7;
+                    int end = content.indexOf("```", start);
+                    if (end > start) {
+                        return content.substring(start, end).trim();
+                    }
+                }
+                
+                if (content.contains("{") && content.contains("}")) {
+                    int start = content.indexOf("{");
+                    int end = content.lastIndexOf("}") + 1;
+                    String json = content.substring(start, end);
+                    if (StringUtils.isJson(json)) {
+                        return json;
+                    }
+                }
+            } catch (Exception e) {
+                log.debug("Failed to extract JSON from content", e);
+            }
+            return null;
         }
 
         private void accumulateFunctionCall(List<?> toolCalls) {
